@@ -4,13 +4,18 @@ verdict per property (src/coverage.zig), over every run whose lines the
 file holds. A property is its `id`; its sites are declared (`hit: false`) by
 each run, and a run reports the first pass and the first failure of each.
 
-    tools/report.py <sdk.jsonl>
+    tools/report.py <sdk.jsonl> [--floor <file>]
 
 FAIL is a property the runs broke: an Always or AlwaysOrUnreachable seen
 false, an Unreachable reached. MISS is one they never got to: a Sometimes
 never true, a Reachable or an Always never reached. Antithesis fails both;
 this exits 1 on a FAIL only, because a MISS is a gap in the runs, not a bug
 (README.md, "Where this differs from Antithesis").
+
+**A FLOOR** is the list of properties a run is expected to reach: one message
+per line, `#` for comments. With one, a MISS of a property on it fails too,
+and so does a line naming no property this run declared, which is a floor
+gone stale.
 """
 import json
 import sys
@@ -19,7 +24,12 @@ import sys
 MUST_HOLD = {"Always", "AlwaysOrUnreachable", "Unreachable"}
 
 
-def main(path):
+def read_floor(path):
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+
+
+def main(path, floor=None):
     props = {}
     runs = 0
     with open(path) as f:
@@ -64,18 +74,32 @@ def main(path):
         rows.append((ok, missed, id_, p))
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
 
-    print(f"{runs} runs, {len(props)} properties")
+    floor = floor or []
+    on_floor = set(floor)
+    stale = [m for m in floor if m not in props]
+    under = [id_ for ok, missed, id_, _ in rows if missed and id_ in on_floor]
+
+    print(f"{runs} runs, {len(props)} properties" + (f", {len(floor)} on the floor" if floor else ""))
     for ok, missed, id_, p in rows:
         where = p["where"]
-        verdict = "ok  " if ok else "MISS" if missed else "FAIL"
-        print(f"{verdict} {p['display']:<19} {id_}  ({where['file']}:{where['begin_line']}; "
+        verdict = "ok  " if ok else ("FLOOR" if id_ in on_floor else "MISS") if missed else "FAIL"
+        print(f"{verdict:<5} {p['display']:<19} {id_}  ({where['file']}:{where['begin_line']}; "
               f"{p['true']} runs true, {p['false']} false)")
         if p["first_false"] is not None and not ok:
             print(f"       first failure: {json.dumps(p['first_false'])}")
-    return 1 if broken else 0
+    for m in stale:
+        print(f"STALE {'floor':<19} {m}  (on the floor, but no run declared it)")
+    if under or stale:
+        print(f"under the floor: {len(under)} never reached, {len(stale)} stale")
+    return 1 if broken or under or stale else 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    floor = None
+    if len(args) == 3 and args[1] == "--floor":
+        floor = read_floor(args[2])
+        args = args[:1]
+    if len(args) != 1:
         sys.exit(__doc__)
-    sys.exit(main(sys.argv[1]))
+    sys.exit(main(args[0], floor))

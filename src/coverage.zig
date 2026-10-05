@@ -344,6 +344,36 @@ pub fn report(w: *std.Io.Writer) !usize {
     return failed;
 }
 
+/// **THE FLOOR**: the properties a run is expected to reach, one message per
+/// line, `#` for comments (tools/report.py reads the same file). Answers how
+/// many fall under it, naming each: a property on it that does not hold for
+/// want of being reached (a MISS), or a line that names no site in this
+/// program, which is a floor gone stale. A FAIL is `report`'s, not this.
+pub fn checkFloor(floor: []const u8, w: *std.Io.Writer) !usize {
+    var under: usize = 0;
+    var lines = std.mem.splitScalar(u8, floor, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var found = false;
+        var missed = false;
+        var it = catalog();
+        while (it.next()) |s| {
+            if (!std.mem.eql(u8, std.mem.span(s.message), line)) continue;
+            found = true;
+            if (!s.holds() and !s.broken()) missed = true;
+        }
+        if (!found) {
+            under += 1;
+            try w.print("STALE  on the floor, but no such property: {s}\n", .{line});
+        } else if (missed) {
+            under += 1;
+            try w.print("FLOOR  never reached: {s}\n", .{line});
+        }
+    }
+    return under;
+}
+
 /// The sites failing now.
 pub fn failing() usize {
     var n: usize = 0;
@@ -442,6 +472,24 @@ test "the wire: version, declarations, then only the first pass and first failur
     try testing.expectEqual(@as(usize, 5), hits);
     try testing.expect(std.mem.indexOf(u8, text, "\"details\":{\"k\":7}") != null);
     try testing.expect(std.mem.indexOf(u8, text, "seven is \\\"forbidden\\\"") != null);
+}
+
+test "the floor: a property on it that was never reached is under it, and so is one that does not exist" {
+    reset();
+    sink = null;
+    exercise(10);
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const floor =
+        \\# what ten turns must reach
+        \\k reaches three
+        \\a thousand
+        \\no such property
+        \\
+    ;
+    try testing.expectEqual(@as(usize, 2), try checkFloor(floor, &w));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "FLOOR  never reached: a thousand") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "STALE  on the floor, but no such property: no such property") != null);
 }
 
 fn generic(wire: anytype) void {
