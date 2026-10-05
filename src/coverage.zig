@@ -137,18 +137,50 @@ pub fn @"unreachable"(comptime src: std.builtin.SourceLocation, comptime message
     record(site(src, .@"unreachable", message), false, details);
 }
 
-/// This call site's one `Site`: a distinct static per (place, kind, message),
-/// because each is a distinct instantiation.
+/// This call site's one `Site`.
+///
+/// **ONE PER PLACE IN THE SOURCE, HOWEVER MANY INSTANTIATIONS.** In a generic
+/// or `anytype` function `@src().fn_name` names the instantiation
+/// (`transmit__anon_44394`), so each instantiation was a Site of its own, and
+/// their exported names collided: a compile error the moment such a function
+/// was called with two types. The suffix is cut, and every string is passed
+/// to `siteOf` as an array, which comptime compares by content; a slice
+/// compares by pointer, and two equal names would still be two Sites.
 fn site(comptime src: std.builtin.SourceLocation, comptime kind: Kind, comptime message: [:0]const u8) *Site {
+    const function = comptime if (std.mem.indexOf(u8, src.fn_name, "__anon_")) |cut| src.fn_name[0..cut] else src.fn_name;
+    return siteOf(kind, arr(src.module), arr(src.file), arr(function), src.line, src.column, arr(message));
+}
+
+fn arr(comptime s: []const u8) [s.len:0]u8 {
+    comptime {
+        var a: [s.len:0]u8 = undefined;
+        @memcpy(a[0..s.len], s);
+        return a;
+    }
+}
+
+fn siteOf(
+    comptime kind: Kind,
+    comptime module: anytype,
+    comptime file: anytype,
+    comptime function: anytype,
+    comptime line: u32,
+    comptime column: u32,
+    comptime message: anytype,
+) *Site {
     const S = struct {
+        const module_ = module;
+        const file_ = file;
+        const function_ = function;
+        const message_ = message;
         var s: Site align(site_size) linksection("zig_coverage_catalog") = .{
             .kind = kind,
-            .message = message,
-            .file = src.file,
-            .function = src.fn_name,
-            .module = src.module,
-            .line = src.line,
-            .column = src.column,
+            .message = &message_,
+            .file = &file_,
+            .function = &function_,
+            .module = &module_,
+            .line = line,
+            .column = column,
         };
         // **EXPORTED, SO DEAD CODE CANNOT TAKE IT.** A site the optimizer
         // proves unreachable is the one the catalog most needs to report,
@@ -157,12 +189,18 @@ fn site(comptime src: std.builtin.SourceLocation, comptime kind: Kind, comptime 
             @export(&s, .{ .name = symbol, .visibility = .hidden });
         }
         const symbol = std.fmt.comptimePrint("zig_coverage_site_{x}", .{std.hash.Wyhash.hash(0, std.fmt.comptimePrint(
-            "{s}\x00{s}\x00{d}\x00{d}\x00{s}\x00{s}",
-            .{ src.module, src.file, src.line, src.column, @tagName(kind), message },
+            "{s}\x00{s}\x00{s}\x00{d}\x00{d}\x00{s}\x00{s}",
+            .{ &module_, &file_, &function_, line, column, @tagName(kind), &message_ },
         ))});
     };
     return &S.s;
 }
+
+/// **THE SECTION'S ANCHOR.** With no site in live code, lld's --gc-sections
+/// dropped the whole section — it does not count `__start_`/`__stop_` as
+/// references — and an optimized build failed to link. Untagged, so the
+/// walk skips it.
+var anchor: [site_size]u8 align(site_size) linksection("zig_coverage_catalog") = @splat(0);
 
 extern var __start_zig_coverage_catalog: Site;
 extern var __stop_zig_coverage_catalog: Site;
@@ -175,6 +213,7 @@ comptime {
 
 /// Every assertion this program was compiled with, reached or not.
 pub fn catalog() Catalog {
+    std.mem.doNotOptimizeAway(&anchor);
     return .{
         .at = @intFromPtr(&__start_zig_coverage_catalog),
         .end = @intFromPtr(&__stop_zig_coverage_catalog),
@@ -380,6 +419,21 @@ test "the wire: version, declarations, then only the first pass and first failur
     try testing.expect(std.mem.indexOf(u8, text, "seven is \\\"forbidden\\\"") != null);
 }
 
+fn generic(wire: anytype) void {
+    _ = wire;
+    sometimes(@src(), true, "inside a generic, called with two types", null);
+}
+
+test "a generic called with two types is one site" {
+    reset();
+    sink = null;
+    generic(@as(u8, 1));
+    generic(@as(u16, 1));
+    const s = mine("inside a generic, called with two types");
+    try testing.expectEqual(@as(u32, 2), s.passes);
+    try testing.expectEqualStrings("generic", std.mem.span(s.function));
+}
+
 test "report names the failures first" {
     reset();
     sink = null;
@@ -392,12 +446,12 @@ test "report names the failures first" {
     const first_ok = std.mem.indexOf(u8, w.buffered(), "ok  ").?;
     try testing.expect(std.mem.indexOf(u8, w.buffered()[first_ok..], "FAIL") == null);
     try testing.expect(std.mem.indexOf(u8, w.buffered()[first_ok..], "MISS") == null);
-    // Of this file's own: "a thousand" never ran, and seven was reached.
-    // (Built beside other files, their sites are in the catalog too.)
+    // Of `exercise`'s: "a thousand" never ran, and seven was reached. (The
+    // catalog holds every other site in the program too.)
     var mine_failing: usize = 0;
     var it = catalog();
     while (it.next()) |s| {
-        if (std.mem.eql(u8, std.mem.span(s.file), @src().file) and !s.holds()) mine_failing += 1;
+        if (std.mem.eql(u8, std.mem.span(s.function), "exercise") and !s.holds()) mine_failing += 1;
     }
     try testing.expectEqual(@as(usize, 2), mine_failing);
 }
