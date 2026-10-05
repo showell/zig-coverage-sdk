@@ -21,7 +21,7 @@ MUST_HOLD = {"Always", "AlwaysOrUnreachable", "Unreachable"}
 
 def main(path):
     props = {}
-    boots = 0
+    runs = 0
     with open(path) as f:
         for n, line in enumerate(f, 1):
             try:
@@ -29,7 +29,7 @@ def main(path):
             except json.JSONDecodeError as e:
                 sys.exit(f"{path}:{n}: not JSON ({e}): {line[:120]!r}")
             if "antithesis_sdk" in event:
-                boots += 1
+                runs += 1
                 continue
             a = event.get("antithesis_assert")
             if a is None:
@@ -64,7 +64,7 @@ def main(path):
         rows.append((ok, missed, id_, p))
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
 
-    print(f"{boots} runs, {len(props)} properties")
+    print(f"{runs} runs, {len(props)} properties")
     for ok, missed, id_, p in rows:
         where = p["where"]
         verdict = "ok  " if ok else "MISS" if missed else "FAIL"
