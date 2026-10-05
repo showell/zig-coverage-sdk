@@ -1,0 +1,7 @@
+.{
+    .name = .zig_coverage_sdk,
+    .version = "0.0.1",
+    .fingerprint = 0xdc34f39e8e4facf2,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "test", "README.md" },
+}

@@ -39,17 +39,41 @@ serial port on a machine with no OS.
 
 ## Using it
 
-It's one file with no dependencies beyond `std`. Its first user,
-[gopher-metal](https://github.com/showell/gopher-metal), takes it as a
-sibling checkout and adds it to each module's imports as `"coverage"`. Zig
-0.16.
+It's a Zig package (Zig 0.16): the module `coverage`, plus the scanner
+described under "The catalog". Its first user,
+[gopher-metal](https://github.com/showell/gopher-metal), declares it as a
+path dependency on a sibling checkout:
+
+```zig
+// build.zig.zon
+.dependencies = .{ .zig_coverage_sdk = .{ .path = "../zig-coverage-sdk" } },
+
+// build.zig
+const sdk = b.dependency("zig_coverage_sdk", .{});
+const coverage = sdk.module("coverage");
+const catalog = @import("zig_coverage_sdk").addCatalog(b, sdk.artifact("coverage-scan"),
+    coverage, b.path("src"), &.{"tcp.zig"});
+// then import both, as "coverage" and "coverage_catalog", into every module
+// that compiles a scanned file
+```
+
+Each scanned file says this once, at container level:
+
+```zig
+comptime {
+    coverage.catalogFile(@import("coverage_catalog"), here());
+}
+fn here() std.builtin.SourceLocation {
+    return @src();
+}
+```
 
 ## The catalog
 
 A `sometimes` that never ran has to be reported, so every assertion must be
 known before any of them runs. As in Antithesis's Rust SDK, each call site is
 a static in a linker section, `zig_coverage_catalog`, and the linker's
-`__start_`/`__stop_` symbols bound it. Three traps, each found by a failing
+`__start_`/`__stop_` symbols bound it. Five traps, each found by a failing
 test and each commented where it's handled:
 
 - **Zig's own linker (Debug) leaves gaps between statics.** Each entry is
@@ -57,9 +81,26 @@ test and each commented where it's handled:
 - **ReleaseSafe dropped sites inside branches it proved dead**, which are
   the sites most worth reporting. Each site is exported under a unique
   hidden name, which keeps it.
+- **Generic code was one site per instantiation**, because `@src().fn_name`
+  names the instantiation, and two instantiations' exported names collided,
+  which was a compile error. The suffix is cut, and the site is keyed by
+  value, so they share one.
+- **With no site in live code, the section was dropped** by the linker's
+  garbage collection, which doesn't count `__start_`/`__stop_` as uses, and
+  an optimized build failed to link. An untagged anchor keeps it.
 - **A site exists only if its function is compiled**, and Zig compiles only
-  what is referenced. Assertions in a function nothing calls are absent.
-  This is open: see "Open".
+  what is referenced. Referencing declarations reaches plain functions, but
+  not generic ones or ones taking `anytype`, whose bodies can't be analyzed
+  without arguments. So, as Antithesis's Go SDK does with its instrumentor,
+  **a build step reads the source**: `tools/scan.zig` parses the files
+  you name with `std.zig.Ast`, and writes a module that registers each
+  assertion it finds, at comptime, as the very `Site` the real call would
+  name. `test/` holds the proof: plain, method, `anytype`, generic, nested
+  and private functions nothing calls, all cataloged once. Two limits:
+  - it matches by name, so another API called `sometimes(@src(), ...)` would
+    be cataloged too;
+  - a scanned file's assertions in code never compiled for this target,
+    such as one behind a `builtin.os` branch, are permanent MISSes.
 
 A freestanding program's link script must keep the section:
 `zig_coverage_catalog : { KEEP(*(zig_coverage_catalog)) }`.
@@ -94,7 +135,6 @@ These are deliberate choices, not oversights.
 
 ## Open
 
-- Assertions in functions nothing references (the catalog's third trap).
 - Whether Antithesis would want a Zig SDK at all. If they do, this repo is
   meant to grow into one.
 

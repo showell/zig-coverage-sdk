@@ -22,8 +22,9 @@
 //! linking, with old bytes in it, so each Site is 64 bytes, 64-aligned and
 //! tagged, and `catalog` steps through 64 bytes at a time, taking only what
 //! carries the tag. A freestanding program's link script must keep the
-//! section. A site is in the catalog when its function is compiled — Zig
-//! compiles only what is referenced — not merely when it is in the source.
+//! section. **A site is in the catalog when its function is compiled** — Zig
+//! compiles only what is referenced — **or when its file is scanned**:
+//! tools/scan.zig reads the source and `catalogFile` registers what it found.
 //!
 //! **THE WIRE** is Antithesis's documented JSONL, as their SDKs write it: on
 //! the first event of the run, one `antithesis_sdk` line and a declaration
@@ -135,6 +136,30 @@ pub fn reachable(comptime src: std.builtin.SourceLocation, comptime message: [:0
 
 pub fn @"unreachable"(comptime src: std.builtin.SourceLocation, comptime message: [:0]const u8, details: anytype) void {
     record(site(src, .@"unreachable", message), false, details);
+}
+
+/// **A SITE THE SOURCE HAS, WHETHER OR NOT ITS CODE IS COMPILED.** Called by
+/// the file tools/scan.zig generates, with the place `@src()` would give the
+/// real call: the same Site, so registering one is the same as compiling it.
+pub fn register(comptime src: std.builtin.SourceLocation, comptime kind: Kind, comptime message: [:0]const u8) void {
+    _ = site(src, kind, message);
+}
+
+/// **EVERY ASSERTION IN THIS FILE, IN THE CATALOG.** A file the scanner reads
+/// says, once, at container level:
+///
+///     comptime {
+///         coverage.catalogFile(@import("coverage_catalog"), here());
+///     }
+///     fn here() std.builtin.SourceLocation {
+///         return @src();
+///     }
+///
+/// (`@src()` is refused outside a function.) Its sites are then in the
+/// catalog of every program that compiles the file, even the ones in
+/// functions nothing calls; build.zig's `addCatalog` makes the module.
+pub fn catalogFile(comptime generated: type, comptime here: std.builtin.SourceLocation) void {
+    generated.sites(here.module, here.file);
 }
 
 /// This call site's one `Site`.

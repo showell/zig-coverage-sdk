@@ -1,24 +1,78 @@
-// zig-coverage-sdk: one module, `coverage`, over src/coverage.zig.
+// zig-coverage-sdk: the `coverage` module, and the scanner that catalogs
+// assertions in code nothing calls (tools/scan.zig).
 //
-//   zig build test     the SDK's own tests, Debug and ReleaseSafe
+//   zig build test     the SDK's own tests, Debug and ReleaseSafe, and the
+//                      scanner judged on test/fixture.zig
 //
-// A program uses it by path, as a sibling checkout: in its build.zig,
-//   b.createModule(.{ .root_source_file = .{ .cwd_relative = "<checkout>/src/coverage.zig" } })
-// added to its modules' imports as "coverage".
+// A program takes it as a dependency (build.zig.zon), then in its build.zig:
+//
+//   const sdk = b.dependency("zig_coverage_sdk", .{});
+//   const coverage = sdk.module("coverage");
+//   const catalog = @import("zig_coverage_sdk").addCatalog(b, sdk.artifact("coverage-scan"),
+//       coverage, b.path("src"), &.{"tcp.zig"});
+//
+// and adds both to the imports of every module that compiles a scanned file,
+// as "coverage" and "coverage_catalog".
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const test_step = b.step("test", "the SDK's own tests, Debug and ReleaseSafe");
+    const coverage = b.addModule("coverage", .{ .root_source_file = b.path("src/coverage.zig") });
+
+    const scan = b.addExecutable(.{
+        .name = "coverage-scan",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/scan.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    b.installArtifact(scan);
+
+    const test_step = b.step("test", "the SDK's own tests, Debug and ReleaseSafe, and the scanner");
     // Both: ReleaseSafe is where the optimizer once dropped sites, Debug
     // where zig's own linker leaves slack between them (src/coverage.zig).
+    const catalog = addCatalog(b, scan, coverage, b.path("test"), &.{"fixture.zig"});
     for ([_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe }) |mode| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
+        const unit = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/coverage.zig"),
             .target = target,
             .optimize = mode,
         }) });
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        test_step.dependOn(&b.addRunArtifact(unit).step);
+        const scanned = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("test/catalog_test.zig"),
+            .target = target,
+            .optimize = mode,
+            .imports = &.{
+                .{ .name = "coverage", .module = coverage },
+                .{ .name = "coverage_catalog", .module = catalog },
+            },
+        }) });
+        test_step.dependOn(&b.addRunArtifact(scanned).step);
     }
-    _ = b.addModule("coverage", .{ .root_source_file = b.path("src/coverage.zig") });
+}
+
+/// **THE CATALOG OF `files`**, as a module: tools/scan.zig run over them (paths
+/// relative to `root`, as `@src().file` gives them), again whenever one
+/// changes. Import it as "coverage_catalog" into every module that compiles
+/// one of the files, beside `coverage` as "coverage"; each file then says
+/// `coverage.catalogFile(...)` once (src/coverage.zig).
+pub fn addCatalog(
+    b: *std.Build,
+    scan: *std.Build.Step.Compile,
+    coverage: *std.Build.Module,
+    root: std.Build.LazyPath,
+    files: []const []const u8,
+) *std.Build.Module {
+    const run = b.addRunArtifact(scan);
+    const generated = run.addOutputFileArg("coverage_catalog.zig");
+    run.addDirectoryArg(root);
+    for (files) |f| {
+        run.addArg(f);
+        run.addFileInput(root.path(b, f));
+    }
+    return b.createModule(.{
+        .root_source_file = generated,
+        .imports = &.{.{ .name = "coverage", .module = coverage }},
+    });
 }
