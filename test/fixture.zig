@@ -44,6 +44,10 @@ pub const Nested = struct {
     };
 };
 
+pub fn neverCalledComparison(slots: u32) void {
+    coverage.alwaysLessThanOrEqualTo(@src(), slots, 256, "comparison, never called", .{ .table = 1 });
+}
+
 fn privateNeverCalled() void {
     coverage.alwaysOrUnreachable(@src(), true, "private, never called", null);
 }

@@ -9,8 +9,9 @@
 //!   scan <out.zig> <root-dir> <file, relative to root-dir>...
 //!
 //! It parses each file with `std.zig.Ast` and finds every call named
-//! `always`, `alwaysOrUnreachable`, `sometimes`, `reachable` or
-//! `@"unreachable"` whose first argument is `@src()` and whose message is a
+//! `always`, `alwaysOrUnreachable`, `sometimes`, `reachable`,
+//! `@"unreachable"` or one of the numeric comparisons (`alwaysGreaterThan`
+//! and the rest) whose first argument is `@src()` and whose message is a
 //! string literal. It writes one Zig file:
 //!
 //!   pub fn sites(comptime module: [:0]const u8, comptime file: []const u8) void
@@ -33,6 +34,15 @@ const kinds = [_]struct { name: []const u8, tag: []const u8, msg_arg: usize }{
     .{ .name = "sometimes", .tag = "sometimes", .msg_arg = 2 },
     .{ .name = "reachable", .tag = "reachable", .msg_arg = 1 },
     .{ .name = "@\"unreachable\"", .tag = "@\"unreachable\"", .msg_arg = 1 },
+    // The numeric comparisons: `(@src(), left, right, message, details)`.
+    .{ .name = "alwaysGreaterThan", .tag = "always_greater_than", .msg_arg = 3 },
+    .{ .name = "alwaysGreaterThanOrEqualTo", .tag = "always_greater_than_or_equal_to", .msg_arg = 3 },
+    .{ .name = "alwaysLessThan", .tag = "always_less_than", .msg_arg = 3 },
+    .{ .name = "alwaysLessThanOrEqualTo", .tag = "always_less_than_or_equal_to", .msg_arg = 3 },
+    .{ .name = "sometimesGreaterThan", .tag = "sometimes_greater_than", .msg_arg = 3 },
+    .{ .name = "sometimesGreaterThanOrEqualTo", .tag = "sometimes_greater_than_or_equal_to", .msg_arg = 3 },
+    .{ .name = "sometimesLessThan", .tag = "sometimes_less_than", .msg_arg = 3 },
+    .{ .name = "sometimesLessThanOrEqualTo", .tag = "sometimes_less_than_or_equal_to", .msg_arg = 3 },
 };
 
 pub fn main(init: std.process.Init) !void {

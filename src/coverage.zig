@@ -19,8 +19,8 @@
 //! one `Site`, a static in the `zig_coverage_catalog` section, which the
 //! linker's `__start_`/`__stop_` symbols bound. **IT IS NOT A PACKED ARRAY:**
 //! zig's own linker (Debug) leaves room after each static for incremental
-//! linking, with old bytes in it, so each Site is 64 bytes, 64-aligned and
-//! tagged, and `catalog` steps through 64 bytes at a time, taking only what
+//! linking, with old bytes in it, so each Site is 128 bytes, 128-aligned and
+//! tagged, and `catalog` steps through 128 bytes at a time, taking only what
 //! carries the tag. A freestanding program's link script must keep the
 //! section. **A site is in the catalog when its function is compiled** — Zig
 //! compiles only what is referenced — **or when its file is scanned**:
@@ -41,32 +41,71 @@ pub const Kind = enum(u8) {
     sometimes,
     reachable,
     @"unreachable",
+    /// **THE NUMERIC COMPARISONS** (Antithesis's `AlwaysGreaterThan` and the
+    /// rest): an `always` or a `sometimes` of `left` against `right`, which
+    /// also remembers how close any call came to the edge (`Site.edge`).
+    always_greater_than,
+    always_greater_than_or_equal_to,
+    always_less_than,
+    always_less_than_or_equal_to,
+    sometimes_greater_than,
+    sometimes_greater_than_or_equal_to,
+    sometimes_less_than,
+    sometimes_less_than_or_equal_to,
 
-    /// The wire's `assert_type`.
-    fn assertType(k: Kind) []const u8 {
+    /// The plain kind a comparison is judged as: `always` or `sometimes`.
+    pub fn basic(k: Kind) Kind {
         return switch (k) {
-            .always, .always_or_unreachable => "always",
-            .sometimes => "sometimes",
-            .reachable, .@"unreachable" => "reachability",
+            .always_greater_than, .always_greater_than_or_equal_to, .always_less_than, .always_less_than_or_equal_to => .always,
+            .sometimes_greater_than, .sometimes_greater_than_or_equal_to, .sometimes_less_than, .sometimes_less_than_or_equal_to => .sometimes,
+            else => k,
         };
     }
 
-    /// The wire's `display_type`.
-    fn display(k: Kind) []const u8 {
+    /// Whether it is a comparison, and so has an edge.
+    pub fn guided(k: Kind) bool {
+        return k.basic() != k;
+    }
+
+    /// **WHICH WAY THE EDGE LIES**, as the Go SDK steers: `left - right`
+    /// maximized or minimized. An always is pushed toward breaking, a
+    /// sometimes toward holding.
+    pub fn maximize(k: Kind) bool {
         return switch (k) {
+            .always_less_than, .always_less_than_or_equal_to, .sometimes_greater_than, .sometimes_greater_than_or_equal_to => true,
+            else => false,
+        };
+    }
+
+    /// The wire's `assert_type`.
+    fn assertType(k: Kind) []const u8 {
+        return switch (k.basic()) {
+            .always, .always_or_unreachable => "always",
+            .sometimes => "sometimes",
+            .reachable, .@"unreachable" => "reachability",
+            else => unreachable,
+        };
+    }
+
+    /// The wire's `display_type`: a comparison's is its plain kind's, as the
+    /// Go SDK writes it.
+    fn display(k: Kind) []const u8 {
+        return switch (k.basic()) {
             .always => "Always",
             .always_or_unreachable => "AlwaysOrUnreachable",
             .sometimes => "Sometimes",
             .reachable => "Reachable",
             .@"unreachable" => "Unreachable",
+            else => unreachable,
         };
     }
 
     /// Whether a run that never reaches it fails it.
     fn mustHit(k: Kind) bool {
-        return switch (k) {
+        return switch (k.basic()) {
             .always, .sometimes, .reachable => true,
             .always_or_unreachable, .@"unreachable" => false,
+            else => unreachable,
         };
     }
 };
@@ -87,6 +126,11 @@ pub const Site = extern struct {
     /// a pass and `unreachable` a failure, as the Go SDK records them.
     passes: u32 = 0,
     fails: u32 = 0,
+    /// **A COMPARISON'S EDGE**: the call that came closest to it, which is
+    /// the most or the least `left - right` (`Kind.maximize`).
+    edge: Operands = .{},
+    /// To `site_size`, which the catalog steps by.
+    reserved: [40]u8 = @splat(0),
 
     pub fn hit(s: *const Site) bool {
         return s.passes + s.fails > 0;
@@ -98,21 +142,92 @@ pub const Site = extern struct {
     /// them apart, because a MISS says the run was short of the case, not
     /// that the code is wrong (README.md, "Where this differs").
     pub fn broken(s: *const Site) bool {
-        return s.fails > 0 and switch (s.kind) {
+        return s.fails > 0 and switch (s.kind.basic()) {
             .always, .always_or_unreachable, .@"unreachable" => true,
             .sometimes, .reachable => false,
+            else => unreachable,
         };
     }
 
     /// The property's verdict, as Antithesis would give it for this run.
     pub fn holds(s: *const Site) bool {
-        return switch (s.kind) {
+        return switch (s.kind.basic()) {
             .always => s.hit() and s.fails == 0,
             .always_or_unreachable, .@"unreachable" => s.fails == 0,
             .sometimes, .reachable => s.passes > 0,
+            else => unreachable,
         };
     }
 };
+
+/// **TWO NUMBERS COMPARED**, kept as their bits and what they are, so a
+/// Site stays `extern`: signed and unsigned integers up to 64 bits, and
+/// floats, as the Go SDK's operands are (int64, uint64, float64).
+pub const Operands = extern struct {
+    what: What = .none,
+    left: u64 = 0,
+    right: u64 = 0,
+
+    pub const What = enum(u8) { none, signed, unsigned, float };
+
+    pub fn of(left: anytype, right: anytype) Operands {
+        const T = Operand(@TypeOf(left, right));
+        const l: T = left;
+        const r: T = right;
+        return switch (@typeInfo(T)) {
+            .float => .{ .what = .float, .left = @bitCast(@as(f64, @floatCast(l))), .right = @bitCast(@as(f64, @floatCast(r))) },
+            .int => |i| if (i.signedness == .signed)
+                .{ .what = .signed, .left = @bitCast(@as(i64, l)), .right = @bitCast(@as(i64, r)) }
+            else
+                .{ .what = .unsigned, .left = @as(u64, l), .right = @as(u64, r) },
+            else => unreachable,
+        };
+    }
+
+    /// `left - right`, exactly: an i128 holds any two 64-bit integers' gap.
+    const Gap = union(enum) { int: i128, float: f64 };
+
+    fn gap(o: Operands) Gap {
+        return switch (o.what) {
+            .signed => .{ .int = @as(i128, @as(i64, @bitCast(o.left))) - @as(i64, @bitCast(o.right)) },
+            .unsigned => .{ .int = @as(i128, o.left) - @as(i128, o.right) },
+            .float => .{ .float = @as(f64, @bitCast(o.left)) - @as(f64, @bitCast(o.right)) },
+            .none => .{ .int = 0 },
+        };
+    }
+
+    /// Whether `o` is nearer the edge than `edge`, which way `maximize` says.
+    fn nearer(o: Operands, edge: Operands, maximize: bool) bool {
+        if (edge.what == .none) return true;
+        const a = o.gap();
+        const b = edge.gap();
+        return switch (a) {
+            .int => |x| if (b == .int) (if (maximize) x > b.int else x < b.int) else false,
+            .float => |x| if (b == .float) (if (maximize) x > b.float else x < b.float) else false,
+        };
+    }
+
+    fn write(o: Operands, w: *std.Io.Writer, comptime which: enum { left, right }) !void {
+        const bits = if (which == .left) o.left else o.right;
+        switch (o.what) {
+            .signed => try w.print("{d}", .{@as(i64, @bitCast(bits))}),
+            .unsigned => try w.print("{d}", .{bits}),
+            .float => try std.json.Stringify.value(@as(f64, @bitCast(bits)), .{}, w),
+            .none => try w.writeAll("null"),
+        }
+    }
+};
+
+/// The type both operands are compared as: a literal is an i64 or an f64.
+fn Operand(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .comptime_int => i64,
+        .comptime_float => f64,
+        .int => |i| if (i.bits > 64) @compileError("operands are at most 64 bits, as the Go SDK's are") else T,
+        .float => |f| if (f.bits > 64) @compileError("operands are at most 64 bits, as the Go SDK's are") else T,
+        else => @compileError("a comparison's operands are numbers"),
+    };
+}
 
 /// Where each line goes, newline included. Null: nowhere, and `report` is
 /// the only way to read the run.
@@ -136,6 +251,67 @@ pub fn reachable(comptime src: std.builtin.SourceLocation, comptime message: [:0
 
 pub fn @"unreachable"(comptime src: std.builtin.SourceLocation, comptime message: [:0]const u8, details: anytype) void {
     record(site(src, .@"unreachable", message), false, details);
+}
+
+/// **THE NUMERIC COMPARISONS**, after Antithesis's `AlwaysGreaterThan` and
+/// the rest: `always(left > right)` and so on, with `left` and `right` added
+/// to the details, and the edge remembered: the call that came closest to
+/// breaking an always, or to making a sometimes hold. So a report can say
+/// "the most slots any run had in use", and an explorer can steer there.
+pub fn alwaysGreaterThan(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .always_greater_than, left, right, message, details);
+}
+
+pub fn alwaysGreaterThanOrEqualTo(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .always_greater_than_or_equal_to, left, right, message, details);
+}
+
+pub fn alwaysLessThan(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .always_less_than, left, right, message, details);
+}
+
+pub fn alwaysLessThanOrEqualTo(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .always_less_than_or_equal_to, left, right, message, details);
+}
+
+pub fn sometimesGreaterThan(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .sometimes_greater_than, left, right, message, details);
+}
+
+pub fn sometimesGreaterThanOrEqualTo(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .sometimes_greater_than_or_equal_to, left, right, message, details);
+}
+
+pub fn sometimesLessThan(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .sometimes_less_than, left, right, message, details);
+}
+
+pub fn sometimesLessThanOrEqualTo(comptime src: std.builtin.SourceLocation, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    compare(src, .sometimes_less_than_or_equal_to, left, right, message, details);
+}
+
+fn compare(comptime src: std.builtin.SourceLocation, comptime kind: Kind, left: anytype, right: anytype, comptime message: [:0]const u8, details: anytype) void {
+    const T = Operand(@TypeOf(left, right));
+    const l: T = left;
+    const r: T = right;
+    const cond = switch (kind) {
+        .always_greater_than, .sometimes_greater_than => l > r,
+        .always_greater_than_or_equal_to, .sometimes_greater_than_or_equal_to => l >= r,
+        .always_less_than, .sometimes_less_than => l < r,
+        .always_less_than_or_equal_to, .sometimes_less_than_or_equal_to => l <= r,
+        else => comptime unreachable,
+    };
+    const s = site(src, kind, message);
+    const ops = Operands.of(l, r);
+    recordWith(s, cond, details, ops);
+    // **A GUIDANCE LINE AT EACH NEW EDGE**: the first call, and every one
+    // nearer the edge than any before. The Go SDK keeps the same extreme;
+    // when it emits is this SDK's rule (README.md, "The numeric comparisons").
+    if (!ops.nearer(s.edge, kind.maximize())) return;
+    s.edge = ops;
+    const out = sink orelse return;
+    declare();
+    emitGuidance(out, s, true);
 }
 
 /// **A SITE THE SOURCE HAS, WHETHER OR NOT ITS CODE IS COMPILED.** Called by
@@ -230,7 +406,7 @@ var anchor: [site_size]u8 align(site_size) linksection("zig_coverage_catalog") =
 extern var __start_zig_coverage_catalog: Site;
 extern var __stop_zig_coverage_catalog: Site;
 
-const site_size = 64;
+const site_size = 128;
 const site_tag: u64 = std.mem.readInt(u64, "zigcover", .little);
 comptime {
     std.debug.assert(@sizeOf(Site) == site_size);
@@ -269,12 +445,16 @@ pub const Catalog = struct {
 var declared = false;
 
 fn record(s: *Site, cond: bool, details: anytype) void {
+    recordWith(s, cond, details, null);
+}
+
+fn recordWith(s: *Site, cond: bool, details: anytype, ops: ?Operands) void {
     const first = if (cond) s.passes == 0 else s.fails == 0;
     if (cond) s.passes +|= 1 else s.fails +|= 1;
     if (!first) return;
     const out = sink orelse return;
     declare();
-    emit(out, s, true, cond, details);
+    emitWith(out, s, true, cond, details, ops);
 }
 
 /// The version line and every site's declaration, once a run. Done on the
@@ -287,22 +467,92 @@ pub fn declare() void {
         @import("builtin").zig_version_string ++
         "\"},\"sdk_version\":\"0.0.1\",\"protocol_version\":\"1.1.0\"}}\n");
     var it = catalog();
-    while (it.next()) |s| emit(out, s, false, false, null);
+    while (it.next()) |s| {
+        emit(out, s, false, false, null);
+        if (s.kind.guided()) emitGuidance(out, s, false);
+    }
 }
 
 /// Long enough for any location; details past it are dropped, not the line.
 var line_buf: [4096]u8 = undefined;
 
 fn emit(out: *const fn ([]const u8) void, s: *const Site, hit: bool, cond: bool, details: anytype) void {
+    emitWith(out, s, hit, cond, details, null);
+}
+
+fn emitWith(out: *const fn ([]const u8) void, s: *const Site, hit: bool, cond: bool, details: anytype, ops: ?Operands) void {
     var w: std.Io.Writer = .fixed(&line_buf);
-    writeLine(&w, s, hit, cond, details) catch {
+    writeLine(&w, s, hit, cond, details, ops) catch {
         w = .fixed(&line_buf);
-        writeLine(&w, s, hit, cond, .{ .coverage_sdk = "details too long for the line buffer" }) catch return;
+        writeLine(&w, s, hit, cond, .{ .coverage_sdk = "details too long for the line buffer" }, ops) catch return;
     };
     out(w.buffered());
 }
 
-fn writeLine(w: *std.Io.Writer, s: *const Site, hit: bool, cond: bool, details: anytype) !void {
+/// **THE GUIDANCE LINE**, as the Go SDK writes `guidanceInfo`, in its order:
+/// `{"antithesis_guidance":{"guidance_data":{"left":..,"right":..},
+/// "location":{..},"guidance_type":"numeric","message":..,"id":..,
+/// "maximize":..,"hit":..}}`; a declaration (`hit: false`) has no data.
+fn emitGuidance(out: *const fn ([]const u8) void, s: *const Site, hit: bool) void {
+    var w: std.Io.Writer = .fixed(&line_buf);
+    writeGuidance(&w, s, hit) catch return;
+    out(w.buffered());
+}
+
+fn writeGuidance(w: *std.Io.Writer, s: *const Site, hit: bool) !void {
+    const message = std.mem.span(s.message);
+    try w.writeAll("{\"antithesis_guidance\":{");
+    if (hit) {
+        try w.writeAll("\"guidance_data\":{\"left\":");
+        try s.edge.write(w, .left);
+        try w.writeAll(",\"right\":");
+        try s.edge.write(w, .right);
+        try w.writeAll("},");
+    }
+    try w.writeAll("\"location\":");
+    try writeLocation(w, s);
+    try w.writeAll(",\"guidance_type\":\"numeric\",\"message\":");
+    try std.json.Stringify.encodeJsonString(message, .{}, w);
+    try w.writeAll(",\"id\":");
+    try std.json.Stringify.encodeJsonString(message, .{}, w);
+    try w.print(",\"maximize\":{},\"hit\":{}}}}}\n", .{ s.kind.maximize(), hit });
+}
+
+fn writeLocation(w: *std.Io.Writer, s: *const Site) !void {
+    try w.writeAll("{\"class\":");
+    try std.json.Stringify.encodeJsonString(std.mem.span(s.module), .{}, w);
+    try w.writeAll(",\"function\":");
+    try std.json.Stringify.encodeJsonString(std.mem.span(s.function), .{}, w);
+    try w.writeAll(",\"file\":");
+    try std.json.Stringify.encodeJsonString(std.mem.span(s.file), .{}, w);
+    try w.print(",\"begin_line\":{d},\"begin_column\":{d}}}", .{ s.line, s.column });
+}
+
+/// The details of a comparison: `left` and `right`, and the caller's own
+/// fields beside them when they are an object, as the Go SDK merges them;
+/// anything else the caller gave goes under `details`.
+fn writeDetails(w: *std.Io.Writer, details: anytype, ops: Operands) !void {
+    try w.writeAll("{\"left\":");
+    try ops.write(w, .left);
+    try w.writeAll(",\"right\":");
+    try ops.write(w, .right);
+    if (@TypeOf(details) != @TypeOf(null)) {
+        var buf: [2048]u8 = undefined;
+        var inner: std.Io.Writer = .fixed(&buf);
+        try std.json.Stringify.value(details, .{}, &inner);
+        const text = inner.buffered();
+        if (text.len > 2 and text[0] == '{') {
+            try w.writeAll(",");
+            try w.writeAll(text[1 .. text.len - 1]);
+        } else if (!std.mem.eql(u8, text, "{}")) {
+            try w.writeAll(",\"details\":");
+            try w.writeAll(text);
+        }
+    }
+    try w.writeAll("}");
+}
+
+fn writeLine(w: *std.Io.Writer, s: *const Site, hit: bool, cond: bool, details: anytype, ops: ?Operands) !void {
     const message = std.mem.span(s.message);
     try w.writeAll("{\"antithesis_assert\":{\"hit\":");
     try w.writeAll(if (hit) "true" else "false");
@@ -312,14 +562,12 @@ fn writeLine(w: *std.Io.Writer, s: *const Site, hit: bool, cond: bool, details: 
     try std.json.Stringify.encodeJsonString(message, .{}, w);
     try w.print(",\"condition\":{},\"id\":", .{cond});
     try std.json.Stringify.encodeJsonString(message, .{}, w);
-    try w.writeAll(",\"location\":{\"class\":");
-    try std.json.Stringify.encodeJsonString(std.mem.span(s.module), .{}, w);
-    try w.writeAll(",\"function\":");
-    try std.json.Stringify.encodeJsonString(std.mem.span(s.function), .{}, w);
-    try w.writeAll(",\"file\":");
-    try std.json.Stringify.encodeJsonString(std.mem.span(s.file), .{}, w);
-    try w.print(",\"begin_line\":{d},\"begin_column\":{d}}}", .{ s.line, s.column });
-    if (@TypeOf(details) != @TypeOf(null)) {
+    try w.writeAll(",\"location\":");
+    try writeLocation(w, s);
+    if (ops) |o| {
+        try w.writeAll(",\"details\":");
+        try writeDetails(w, details, o);
+    } else if (@TypeOf(details) != @TypeOf(null)) {
         try w.writeAll(",\"details\":");
         try std.json.Stringify.value(details, .{}, w);
     }
@@ -334,11 +582,18 @@ pub fn report(w: *std.Io.Writer) !usize {
         while (it.next()) |s| {
             if (s.holds() != pass) continue;
             if (!pass) failed += 1;
-            try w.print("{s} {s:<19} {s}  ({s}:{d}; {d} true, {d} false)\n", .{
+            try w.print("{s} {s:<19} {s}  ({s}:{d}; {d} true, {d} false", .{
                 if (pass) "ok  " else if (s.broken()) "FAIL" else "MISS", s.kind.display(), s.message,
                 s.file,                                                   s.line,           s.passes,
                 s.fails,
             });
+            if (s.kind.guided() and s.edge.what != .none) {
+                try w.writeAll("; its edge: left ");
+                try s.edge.write(w, .left);
+                try w.writeAll(", right ");
+                try s.edge.write(w, .right);
+            }
+            try w.writeAll(")\n");
         }
     }
     return failed;
@@ -390,6 +645,7 @@ pub fn reset() void {
     while (it.next()) |s| {
         s.passes = 0;
         s.fails = 0;
+        s.edge = .{};
     }
     declared = false;
 }
@@ -463,6 +719,8 @@ test "the wire: version, declarations, then only the first pass and first failur
             first = false;
             continue;
         }
+        // A comparison's guidance lines (their own test) are not asserts.
+        if (parsed.value.object.get("antithesis_guidance") != null) continue;
         const a = parsed.value.object.get("antithesis_assert").?.object;
         if (a.get("hit").?.bool) hits += 1 else declarations += 1;
     }
@@ -527,4 +785,97 @@ test "report names the failures first" {
         if (std.mem.eql(u8, std.mem.span(s.function), "exercise") and !s.holds()) mine_failing += 1;
     }
     try testing.expectEqual(@as(usize, 2), mine_failing);
+}
+
+fn slots(n: u32) void {
+    alwaysLessThanOrEqualTo(@src(), n, 256, "slots in use stay within the table", .{ .conn = n });
+}
+
+fn freeClusters(n: i64) void {
+    sometimesLessThan(@src(), n, 10, "free clusters run low", null);
+}
+
+test "a comparison is its plain kind's verdict, and remembers its edge" {
+    reset();
+    sink = null;
+    const s = mine("slots in use stay within the table");
+    try testing.expect(s.kind.guided());
+    try testing.expect(!s.holds()); // never reached: an always's MISS
+    for ([_]u32{ 3, 200, 17 }) |n| slots(n);
+    try testing.expect(s.holds());
+    // Always(left <= right) is pushed toward breaking: the most left - right.
+    try testing.expectEqual(@as(u64, 200), s.edge.left);
+    slots(300);
+    try testing.expect(s.broken());
+    try testing.expectEqual(@as(u64, 300), s.edge.left);
+
+    const f = mine("free clusters run low");
+    for ([_]i64{ 400, 30, 90 }) |n| freeClusters(n);
+    try testing.expect(!f.holds()); // a sometimes never true: a MISS, not a FAIL
+    try testing.expect(!f.broken());
+    // Sometimes(left < right) is pushed toward holding: the least left - right.
+    try testing.expectEqual(@as(i64, 30), @as(i64, @bitCast(f.edge.left)));
+    freeClusters(-2);
+    try testing.expect(f.holds());
+
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    _ = try report(&w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "slots in use stay within the table  (coverage.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "its edge: left 300, right 256)") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "its edge: left -2, right 10)") != null);
+}
+
+test "the wire: a comparison's details carry left and right, and a guidance line goes out at each new edge" {
+    reset();
+    captured_len = 0;
+    sink = capture;
+    defer sink = null;
+    for ([_]u32{ 3, 200, 17, 250 }) |n| slots(n);
+    const text = captured[0..captured_len];
+    var guidance_hit: usize = 0;
+    var guidance_declared: usize = 0;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    while (lines.next()) |line| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer parsed.deinit();
+        if (parsed.value.object.get("antithesis_assert")) |a| {
+            if (!std.mem.eql(u8, a.object.get("message").?.string, "slots in use stay within the table")) continue;
+            try testing.expectEqualStrings("Always", a.object.get("display_type").?.string);
+            if (a.object.get("hit").?.bool) {
+                const d = a.object.get("details").?.object;
+                try testing.expectEqual(@as(i64, 3), d.get("left").?.integer);
+                try testing.expectEqual(@as(i64, 256), d.get("right").?.integer);
+                try testing.expectEqual(@as(i64, 3), d.get("conn").?.integer);
+            }
+        }
+        const g = (parsed.value.object.get("antithesis_guidance") orelse continue).object;
+        if (!std.mem.eql(u8, g.get("message").?.string, "slots in use stay within the table")) continue;
+        try testing.expectEqualStrings("numeric", g.get("guidance_type").?.string);
+        try testing.expect(g.get("maximize").?.bool);
+        try testing.expectEqualStrings("coverage.zig", g.get("location").?.object.get("file").?.string);
+        if (!g.get("hit").?.bool) {
+            guidance_declared += 1;
+            try testing.expect(g.get("guidance_data") == null);
+            continue;
+        }
+        guidance_hit += 1;
+        try testing.expectEqual(@as(i64, 256), g.get("guidance_data").?.object.get("right").?.integer);
+    }
+    try testing.expectEqual(@as(usize, 1), guidance_declared);
+    // 3, then 200, then 250: each nearer the edge; 17 is not.
+    try testing.expectEqual(@as(usize, 3), guidance_hit);
+    try testing.expect(std.mem.indexOf(u8, text, "\"guidance_data\":{\"left\":250,\"right\":256}") != null);
+}
+
+test "operands: literals, signed and unsigned, floats, and the gap between 64-bit extremes exactly" {
+    const a = Operands.of(@as(u64, std.math.maxInt(u64)), @as(u64, 0));
+    const b = Operands.of(@as(u64, std.math.maxInt(u64) - 1), @as(u64, 0));
+    try testing.expect(a.nearer(b, true));
+    try testing.expect(!b.nearer(a, true));
+    const c = Operands.of(-5, 3);
+    try testing.expectEqual(Operands.What.signed, c.what);
+    const f = Operands.of(@as(f32, 1.5), 2.0);
+    try testing.expectEqual(Operands.What.float, f.what);
+    try testing.expect(f.nearer(Operands.of(@as(f64, 9.0), 2.0), false));
 }

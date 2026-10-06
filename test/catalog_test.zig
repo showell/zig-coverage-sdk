@@ -34,6 +34,7 @@ test "every assertion in the scanned file, called or not, once each" {
         "generic, never called",
         "nested, never called",
         "private, never called",
+        "comparison, never called",
     }) |m| {
         testing.expectEqual(@as(usize, 1), count(m)) catch |e| {
             std.debug.print("not cataloged exactly once: {s}\n", .{m});
