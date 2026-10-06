@@ -26,6 +26,23 @@ coverage.reachable(@src(), "a silent peer is given up on", .{ .conn = i });
 | `reachable(@src(), msg, details)` | reached at least once |
 | `@"unreachable"(@src(), msg, details)` | never reached |
 
+**The numeric comparisons**, after Antithesis's `AlwaysGreaterThan` and the
+rest, in Zig's case: `alwaysGreaterThan`, `alwaysGreaterThanOrEqualTo`,
+`alwaysLessThan`, `alwaysLessThanOrEqualTo`, and the same four as
+`sometimes...`. Each is an `always` or a `sometimes` of `left` against
+`right`, judged as that kind, with `left` and `right` in its details, and it
+remembers its **edge**: the call nearest to breaking an always, or to making
+a sometimes hold (the most or the least `left - right`, which way the Go SDK
+steers each one).
+
+```zig
+coverage.alwaysLessThanOrEqualTo(@src(), in_use, slots.len, "slots in use stay within the table", null);
+```
+
+Operands are integers of up to 64 bits or floats, as the Go SDK's are. The
+report gives each comparison's edge:
+`ok   Always  slots in use ...  (tcp.zig:310; 812 true, 0 false; its edge: left 255, right 256)`.
+
 The message names the property and must be comptime. `details` is anything
 `std.json` can write, or `null`.
 
@@ -35,7 +52,8 @@ also goes out as a JSONL line, to whatever the program chooses: a file, or a
 serial port on a machine with no OS.
 
     zig build test      # the SDK's own tests, Debug and ReleaseSafe
-    tools/report.py sdk.jsonl
+    python3 tools/report_test.py
+    tools/report.py sdk.jsonl [more.jsonl ...] [--floor floor.txt]
 
 ## Using it
 
@@ -77,7 +95,7 @@ a static in a linker section, `zig_coverage_catalog`, and the linker's
 test and each commented where it's handled:
 
 - **Zig's own linker (Debug) leaves gaps between statics.** Each entry is
-  64 bytes, aligned and tagged, and the walk takes only tagged ones.
+  128 bytes, aligned and tagged, and the walk takes only tagged ones.
 - **ReleaseSafe dropped sites inside branches it proved dead**, which are
   the sites most worth reporting. Each site is exported under a unique
   hidden name, which keeps it.
@@ -124,11 +142,33 @@ These are deliberate choices, not oversights.
 - **The verdict can be read in-process.** `report` and `failing()` need no
   external platform: a test or simulator judges its own run.
 
+## The numeric comparisons, on the wire
+
+Each writes its assertion line as the Go SDK does: `display_type` and
+`assert_type` are the plain kind's (`Always`, `Sometimes`), and `left` and
+`right` are added to the details beside the caller's own fields (a caller's
+details that are not an object go under `details`). Beside it, an
+`antithesis_guidance` line in the Go SDK's `guidanceInfo` order:
+`{"guidance_data":{"left":..,"right":..},"location":{..},"guidance_type":"numeric","message":..,"id":..,"maximize":..,"hit":..}`,
+declared once a run with `hit: false` and no data, as every site is.
+
+**When a guidance line goes out is this SDK's rule**: the first call, and
+every call nearer the edge than any before it in this run. The Go SDK keeps
+the same extreme per assertion, but its tracker's source was not to hand
+when this was written, so the exact rule there may differ.
+
+`tools/report.py` reads many runs at once (metal-vmm's `metal_vmm_run`
+lines name them; a file without them is a run per boot) and says, for each
+property, how many runs reached it and which first, for each comparison the
+nearest any run came to its edge and which run, and the properties only one
+run ever reached. `python3 tools/report_test.py` is its own test.
+
 ## What is missing, compared with their SDKs
 
 - randomness (`get_random`, `random_choice`) and lifecycle (`setup_complete`,
   `send_event`);
-- the guidance assertions (`always_greater_than`, `sometimes_all`, ...);
+- the boolean guidance assertions (`AlwaysSome`, `SometimesAll`) and raw
+  guidance (`NumericGuidanceRaw`, `BooleanGuidanceRaw`);
 - their native output path (`libvoidstar.so`, loaded when present); only
   the JSONL is written, through `sink`;
 - thread safety: one thread is assumed.
