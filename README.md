@@ -182,9 +182,20 @@ details that are not an object go under `details`). Beside it, an
 declared once a run with `hit: false` and no data, as every site is.
 
 **When a guidance line goes out is this SDK's rule**: the first call, and
-every call nearer the edge than any before it in this run. The Go SDK keeps
+every call nearer the edge, or further in its reach (below), than any before
+it in this run. The Go SDK keeps
 the same extreme per assertion; whether it emits on the same rule is
 unchecked.
+
+**Edge and reach.** The edge is the call nearest the limit (`left -
+right`), so a full table of 256 is the same edge as a full table of 2. So a
+comparison also keeps its **reach**, the furthest `left` went the way it
+steers, and a guidance line goes out at each new reach as well as each new
+edge; every line is the call's own operands. `report()` and `report.py`
+print both, and `report.py --edges <file>` is a floor for reaches: a line
+`tcp: slots in use stay within the table  >= 64` fails the runs if that
+comparison's reach never got there (EDGE), and a line naming no comparison,
+or with the sign against the way it steers, is STALE.
 
 `tools/report.py` reads many runs at once. A run is a line metal-vmm writes
 before its guest's output, such as

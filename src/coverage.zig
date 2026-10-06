@@ -129,8 +129,13 @@ pub const Site = extern struct {
     /// **A COMPARISON'S EDGE**: the call that came closest to it, which is
     /// the most or the least `left - right` (`Kind.maximize`).
     edge: Operands = .{},
+    /// **HOW FAR `left` WENT**, the way the edge lies: the most `left` of a
+    /// comparison that maximizes, the least of one that minimizes. Not the
+    /// edge: a table of 256 slots full is the same edge as one of 2 full
+    /// (`left - right` is 0 for both), and only this tells them apart.
+    reach: Operands = .{},
     /// To `site_size`, which the catalog steps by.
-    reserved: [40]u8 = @splat(0),
+    reserved: [16]u8 = @splat(0),
 
     pub fn hit(s: *const Site) bool {
         return s.passes + s.fails > 0;
@@ -193,6 +198,18 @@ pub const Operands = extern struct {
             .unsigned => .{ .int = @as(i128, o.left) - @as(i128, o.right) },
             .float => .{ .float = @as(f64, @bitCast(o.left)) - @as(f64, @bitCast(o.right)) },
             .none => .{ .int = 0 },
+        };
+    }
+
+    /// Whether `o`'s left is further than `reach`'s, which way `maximize`
+    /// says.
+    fn further(o: Operands, reach: Operands, maximize: bool) bool {
+        if (reach.what == .none) return true;
+        return switch (o.what) {
+            .signed => if (maximize) @as(i64, @bitCast(o.left)) > @as(i64, @bitCast(reach.left)) else @as(i64, @bitCast(o.left)) < @as(i64, @bitCast(reach.left)),
+            .unsigned => if (maximize) o.left > reach.left else o.left < reach.left,
+            .float => if (maximize) @as(f64, @bitCast(o.left)) > @as(f64, @bitCast(reach.left)) else @as(f64, @bitCast(o.left)) < @as(f64, @bitCast(reach.left)),
+            .none => false,
         };
     }
 
@@ -304,14 +321,20 @@ fn compare(comptime src: std.builtin.SourceLocation, comptime kind: Kind, left: 
     const s = site(src, kind, message);
     const ops = Operands.of(l, r);
     recordWith(s, cond, details, ops);
-    // **A GUIDANCE LINE AT EACH NEW EDGE**: the first call, and every one
-    // nearer the edge than any before. The Go SDK keeps the same extreme;
+    // **A GUIDANCE LINE AT EACH NEW EDGE, AND EACH NEW REACH**: the first
+    // call, every one nearer the edge than any before, and every one whose
+    // `left` went further. Each line is the call's own operands, so a reader
+    // that keeps the best `left - right` gets the edge, and one that keeps
+    // the furthest `left` gets the reach. The Go SDK keeps the same edge;
     // when it emits is this SDK's rule (README.md, "The numeric comparisons").
-    if (!ops.nearer(s.edge, kind.maximize())) return;
-    s.edge = ops;
+    const nearer = ops.nearer(s.edge, kind.maximize());
+    const further = ops.further(s.reach, kind.maximize());
+    if (!nearer and !further) return;
+    if (nearer) s.edge = ops;
+    if (further) s.reach = ops;
     const out = sink orelse return;
     declare();
-    emitGuidance(out, s, true);
+    emitGuidance(out, s, ops);
 }
 
 /// **A SITE THE SOURCE HAS, WHETHER OR NOT ITS CODE IS COMPILED.** Called by
@@ -469,7 +492,7 @@ pub fn declare() void {
     var it = catalog();
     while (it.next()) |s| {
         emit(out, s, false, false, null);
-        if (s.kind.guided()) emitGuidance(out, s, false);
+        if (s.kind.guided()) emitGuidance(out, s, null);
     }
 }
 
@@ -493,20 +516,21 @@ fn emitWith(out: *const fn ([]const u8) void, s: *const Site, hit: bool, cond: b
 /// `{"antithesis_guidance":{"guidance_data":{"left":..,"right":..},
 /// "location":{..},"guidance_type":"numeric","message":..,"id":..,
 /// "maximize":..,"hit":..}}`; a declaration (`hit: false`) has no data.
-fn emitGuidance(out: *const fn ([]const u8) void, s: *const Site, hit: bool) void {
+fn emitGuidance(out: *const fn ([]const u8) void, s: *const Site, ops: ?Operands) void {
     var w: std.Io.Writer = .fixed(&line_buf);
-    writeGuidance(&w, s, hit) catch return;
+    writeGuidance(&w, s, ops) catch return;
     out(w.buffered());
 }
 
-fn writeGuidance(w: *std.Io.Writer, s: *const Site, hit: bool) !void {
+fn writeGuidance(w: *std.Io.Writer, s: *const Site, ops: ?Operands) !void {
     const message = std.mem.span(s.message);
+    const hit = ops != null;
     try w.writeAll("{\"antithesis_guidance\":{");
-    if (hit) {
+    if (ops) |o| {
         try w.writeAll("\"guidance_data\":{\"left\":");
-        try s.edge.write(w, .left);
+        try o.write(w, .left);
         try w.writeAll(",\"right\":");
-        try s.edge.write(w, .right);
+        try o.write(w, .right);
         try w.writeAll("},");
     }
     try w.writeAll("\"location\":");
@@ -592,6 +616,12 @@ pub fn report(w: *std.Io.Writer) !usize {
                 try s.edge.write(w, .left);
                 try w.writeAll(", right ");
                 try s.edge.write(w, .right);
+                if (s.reach.left != s.edge.left) {
+                    try w.writeAll("; its reach: left ");
+                    try s.reach.write(w, .left);
+                    try w.writeAll(", right ");
+                    try s.reach.write(w, .right);
+                }
             }
             try w.writeAll(")\n");
         }
@@ -646,6 +676,7 @@ pub fn reset() void {
         s.passes = 0;
         s.fails = 0;
         s.edge = .{};
+        s.reach = .{};
     }
     declared = false;
 }
@@ -866,6 +897,40 @@ test "the wire: a comparison's details carry left and right, and a guidance line
     // 3, then 200, then 250: each nearer the edge; 17 is not.
     try testing.expectEqual(@as(usize, 3), guidance_hit);
     try testing.expect(std.mem.indexOf(u8, text, "\"guidance_data\":{\"left\":250,\"right\":256}") != null);
+}
+
+fn tableFull(in_use: u32, len: u32) void {
+    alwaysLessThanOrEqualTo(@src(), in_use, len, "a table is never past full", null);
+}
+
+test "reach: a full table of 203 is the same edge as one of 2, and a further reach" {
+    reset();
+    captured_len = 0;
+    sink = capture;
+    defer sink = null;
+    tableFull(2, 2);
+    tableFull(1, 2);
+    tableFull(203, 203);
+    tableFull(100, 203);
+    const s = mine("a table is never past full");
+    try testing.expectEqual(@as(u64, 2), s.edge.left); // the first gap of 0 is kept
+    try testing.expectEqual(@as(u64, 203), s.reach.left);
+    // Guidance lines: the declaration, (2,2) as edge and reach, (203,203)
+    // as reach only; (1,2) and (100,203) are neither.
+    const text = captured[0..captured_len];
+    var n: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, text, at, "\"message\":\"a table is never past full\",\"id\"")) |i| : (at = i + 1) {
+        if (std.mem.lastIndexOf(u8, text[0..i], "antithesis_guidance")) |g| if (std.mem.lastIndexOfScalar(u8, text[0..i], '\n') orelse 0 <= g) {
+            n += 1;
+        };
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expect(std.mem.indexOf(u8, text, "\"guidance_data\":{\"left\":203,\"right\":203}") != null);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    _ = try report(&w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "its edge: left 2, right 2; its reach: left 203, right 203)") != null);
 }
 
 test "operands: literals, signed and unsigned, floats, and the gap between 64-bit extremes exactly" {

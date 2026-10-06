@@ -50,7 +50,7 @@ def boot(*hits):
 
 
 class Report(unittest.TestCase):
-    def judge(self, *files, floor=None):
+    def judge(self, *files, floor=None, edges=None):
         paths = []
         with tempfile.TemporaryDirectory() as d:
             for i, events in enumerate(files):
@@ -65,9 +65,15 @@ class Report(unittest.TestCase):
                 with open(fp, "w") as f:
                     f.write(floor)
                 fl = report.read_floor(fp)
+            ed = None
+            if edges is not None:
+                ep = os.path.join(d, "edges.txt")
+                with open(ep, "w") as f:
+                    f.write(edges)
+                ed = report.read_edges(ep)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = report.main(paths, fl)
+                code = report.main(paths, fl, ed)
             return code, out.getvalue().replace(d + "/", "")
 
     def line(self, text, prop):
@@ -124,6 +130,41 @@ class Report(unittest.TestCase):
         _, text = self.judge(boot(assertion("slots", "Always", True, True),
                                   guidance("slots", False, 30, 10), guidance("slots", False, 12, 10)))
         self.assertIn("its edge: left 12, right 10", self.line(text, "slots"))
+
+    def test_a_reach_tells_a_full_table_of_203_from_one_of_2(self):
+        _, text = self.judge(
+            [run(1)] + boot(assertion("slots", "Always", True, True),
+                            guidance("slots", True, 2, 2), guidance("slots", True, 203, 203))
+            + [run(2)] + boot(guidance("slots", True, 90, 100)))
+        line = self.line(text, "slots")
+        self.assertIn("its edge: left 2, right 2, in FAULT_SEED=1; its reach: left 203, right 203, in FAULT_SEED=1", line)
+
+    def test_the_edge_floor(self):
+        runs = [run(1)] + boot(assertion("slots", "Always", True, True),
+                               guidance("slots", True, 2, 2), guidance("slots", True, 70, 70))
+        code, text = self.judge(runs, edges="# how full\nslots  >= 64\n")
+        self.assertEqual(code, 0)
+        self.assertNotIn("EDGE", text)
+        code, text = self.judge(runs, edges="slots  >= 128\n")
+        self.assertEqual(code, 1)
+        self.assertIn("EDGE  short               slots  (wanted left >= 128; its reach: left 70)", text)
+        self.assertIn("short of the edge floor: 1", text)
+        # The wrong way round, and a comparison nobody declared.
+        code, text = self.judge(runs, edges="slots  <= 3\nno such  >= 1\n")
+        self.assertEqual(code, 1)
+        self.assertIn("STALE edge                slots  (<= 3, but it maximizes: its reach is its most left)", text)
+        self.assertIn("STALE edge                no such  (on the edge floor", text)
+        # Declared, never reached.
+        code, text = self.judge(boot(), edges="slots  >= 1\n")
+        self.assertIn("(wanted left >= 1; never reached)", text)
+
+    def test_an_edge_floor_line_must_have_a_sign_and_a_number(self):
+        with tempfile.TemporaryDirectory() as d:
+            ep = os.path.join(d, "edges.txt")
+            with open(ep, "w") as f:
+                f.write("slots at least 64\n")
+            with self.assertRaises(SystemExit):
+                report.read_edges(ep)
 
     def test_long_sh_reads_the_same_lines(self):
         # gopher-metal's long.sh keeps only these: the verdict prefixes, the

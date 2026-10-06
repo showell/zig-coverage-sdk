@@ -4,7 +4,7 @@ verdict per property (src/coverage.zig), over every run the files hold. A
 property is its `id`; its sites are declared (`hit: false`) by each run, and
 a run reports the first pass and the first failure of each.
 
-    tools/report.py <a.jsonl> [b.jsonl ...] [--floor <file>]
+    tools/report.py <a.jsonl> [b.jsonl ...] [--floor <file>] [--edges <file>]
 
 FAIL is a property the runs broke: an Always or AlwaysOrUnreachable seen
 false, an Unreachable reached. MISS is one they never got to: a Sometimes
@@ -27,14 +27,47 @@ ones an explorer steers toward.
 **THE NUMERIC COMPARISONS** (`alwaysGreaterThan` and the rest) also write
 `antithesis_guidance` lines at each new edge; for each, the report gives the
 nearest any run came (the most or the least `left - right`, as the line's
-`maximize` says) and which run it was.
+`maximize` says) and which run it was, and its **reach**: the furthest
+`left` went the way the comparison steers (the most `left` of one that
+maximizes, the least of one that minimizes). The reach is what tells a full
+table of 256 from a full table of 2, which are the same edge.
+
+**AN EDGE FLOOR** (`--edges <file>`) is how far each comparison must reach:
+one line each, the message, then `>=` or `<=` and a number, `#` for comments:
+
+    tcp: slots in use stay within the table  >= 64
+
+`>=` judges a comparison that maximizes by its most `left`, `<=` one that
+minimizes by its least. A comparison that never reached the number fails
+(EDGE), and so does a line naming no comparison any run declared, or one
+whose sign is not the way that comparison steers (STALE).
 """
+import re
 import json
 import sys
 
 # The kinds a false condition breaks (Unreachable records its hit as false).
 MUST_HOLD = {"Always", "AlwaysOrUnreachable", "Unreachable"}
 RUN_KEY = "metal_vmm_run"
+
+
+EDGE_LINE = re.compile(r"^(.*\S)\s+(>=|<=)\s+(-?[0-9]+(?:\.[0-9]+)?)$")
+
+
+def read_edges(path):
+    """[(message, sign, number)] from an edge floor; exits on a bad line."""
+    out = []
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = EDGE_LINE.match(line)
+            if m is None:
+                sys.exit(f"{path}:{n}: not '<message>  >= <number>' or '<= <number>': {line!r}")
+            number = float(m.group(3)) if "." in m.group(3) else int(m.group(3))
+            out.append((m.group(1), m.group(2), number))
+    return out
 
 
 def read_floor(path):
@@ -59,6 +92,9 @@ class Runs:
         self.names = []
         self.props = {}
         self.edges = {}
+        self.reaches = {}
+        # Every numeric comparison declared, and whether it maximizes.
+        self.declared_guidance = {}
 
     def read(self, path):
         events = []
@@ -89,7 +125,10 @@ class Runs:
                 in_run = True
             run = len(self.names) - 1
             if "antithesis_guidance" in event:
-                self.guidance(event["antithesis_guidance"], run)
+                g = event["antithesis_guidance"]
+                if g.get("guidance_type") == "numeric":
+                    self.declared_guidance[g["id"]] = bool(g.get("maximize"))
+                self.guidance(g, run)
                 continue
             a = event.get("antithesis_assert")
             if a is None:
@@ -125,9 +164,12 @@ class Runs:
         maximize = bool(g.get("maximize"))
         if best is None or (gap > best["gap"] if maximize else gap < best["gap"]):
             self.edges[g["id"]] = {"gap": gap, "left": left, "right": right, "run": run}
+        far = self.reaches.get(g["id"])
+        if far is None or (left > far["left"] if maximize else left < far["left"]):
+            self.reaches[g["id"]] = {"left": left, "right": right, "run": run, "maximize": maximize}
 
 
-def main(paths, floor=None):
+def main(paths, floor=None, edges=None):
     runs = Runs()
     for path in paths:
         runs.read(path)
@@ -164,6 +206,9 @@ def main(paths, floor=None):
             reached += f", first {names[p['first_run']]}"
         edge = runs.edges.get(id_)
         at_edge = f"; its edge: left {edge['left']}, right {edge['right']}, in {names[edge['run']]}" if edge else ""
+        far = runs.reaches.get(id_)
+        if far and edge and far["left"] != edge["left"]:
+            at_edge += f"; its reach: left {far['left']}, right {far['right']}, in {names[far['run']]}"
         print(f"{verdict:<5} {p['display']:<19} {id_}  ({where['file']}:{where['begin_line']}; "
               f"{reached}; {p['true']} true, {p['false']} false{at_edge})")
         if p["first_false"] is not None and not ok:
@@ -177,18 +222,44 @@ def main(paths, floor=None):
         print(f"STALE {'floor':<19} {m}  (on the floor, but no run declared it)")
     if under or stale:
         print(f"under the floor: {len(under)} never reached, {len(stale)} stale")
-    return 1 if broken or under or stale else 0
+    short = 0
+    for message, sign, number in edges or []:
+        if message not in runs.declared_guidance:
+            print(f"STALE {'edge':<19} {message}  (on the edge floor, but no run declared such a comparison)")
+            short += 1
+            continue
+        steers = runs.declared_guidance[message]
+        far = runs.reaches.get(message)
+        if (sign == ">=") != steers:
+            way = "maximizes" if steers else "minimizes"
+            print(f"STALE {'edge':<19} {message}  ({sign} {number}, but it {way}: its reach is its "
+                  f"{'most' if steers else 'least'} left)")
+            short += 1
+            continue
+        reached = far["left"] if far else None
+        if reached is None or (reached < number if sign == ">=" else reached > number):
+            print(f"EDGE  {'short':<19} {message}  (wanted left {sign} {number}; "
+                  f"{'never reached' if reached is None else f'its reach: left {reached}'})")
+            short += 1
+    if short:
+        print(f"short of the edge floor: {short}")
+    return 1 if broken or under or stale or short else 0
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     floor = None
-    if "--floor" in args:
-        at = args.index("--floor")
-        if at + 1 >= len(args):
-            sys.exit(__doc__)
-        floor = read_floor(args[at + 1])
-        args = args[:at] + args[at + 2:]
+    edges = None
+    for flag in ("--floor", "--edges"):
+        if flag in args:
+            at = args.index(flag)
+            if at + 1 >= len(args):
+                sys.exit(__doc__)
+            if flag == "--floor":
+                floor = read_floor(args[at + 1])
+            else:
+                edges = read_edges(args[at + 1])
+            args = args[:at] + args[at + 2:]
     if not args:
         sys.exit(__doc__)
-    sys.exit(main(args, floor))
+    sys.exit(main(args, floor, edges))
