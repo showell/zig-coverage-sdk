@@ -49,11 +49,27 @@ The message names the property and must be comptime. `details` is anything
 At the end of a run, `report(writer)` gives every property a verdict, and
 `failing()` counts the ones that don't hold. If a `sink` is set, each event
 also goes out as a JSONL line, to whatever the program chooses: a file, or a
-serial port on a machine with no OS.
+serial port on a machine with no OS. Set `sink` before `declare()` or the
+first assertion: `declare()` (called by the first event, or at startup by a
+harness) writes the version line and every site's declaration once a run, and
+marks the run declared even with no `sink`, so a `sink` set later never gets
+them.
 
     zig build test      # the SDK's own tests, Debug and ReleaseSafe
     python3 tools/report_test.py
     tools/report.py sdk.jsonl [more.jsonl ...] [--floor floor.txt]
+
+## Who uses it, and what a change here breaks
+
+[gopher-metal](https://github.com/showell/gopher-metal) depends on this repo
+**by path, with no version pin** (below), so every push to `main` changes its
+build at once. Every change here is a change to gopher-metal's build; say in
+the commit what it would see. The flow: gopher-metal's simulators
+(`zig build properties`) and its `-Dcoverage` kernels (on COM1) emit the
+JSONL; [metal-vmm](https://github.com/showell/metal-vmm) collects a run's
+lines into `COVERAGE_OUT`; gopher-metal's `long.sh` judges them with
+`tools/report.py --floor` against `coverage/floor-sim.txt` and
+`coverage/floor-metal.txt`.
 
 ## Using it
 
@@ -134,13 +150,26 @@ These are deliberate choices, not oversights.
   `sometimes` never true, or a `reachable` or `always` never reached. A FAIL
   says the code is wrong; a MISS says the run was short of the case. Both
   appear in the report, and the program decides which ones gate.
-- **Tiered gating follows from that.** The intended use is that a FAIL
-  fails every tier of testing, from a quick pre-commit run to a long hunt,
-  while a MISS fails only a long run, and only for properties on a list
-  that run is expected to reach. A quick gate can't promise to reach rare
-  cases, and shouldn't be failed for not reaching them.
+- **Tiered gating follows from that.** A FAIL should fail every tier, from
+  a quick pre-commit run to a long hunt; a MISS should fail only a long run,
+  and only for properties on its floor (below). A quick gate can't promise
+  to reach rare cases.
 - **The verdict can be read in-process.** `report` and `failing()` need no
-  external platform: a test or simulator judges its own run.
+  external platform: a test or simulator judges its own run. Both count
+  every property that does not hold, MISSes included, so a quick gate that
+  fails only on FAILs walks `catalog()` and checks each site's `broken()`.
+  `tools/report.py` exits 1 on a FAIL only, unless given a floor.
+
+## The floor
+
+A floor file lists the properties a run must reach: one message per line,
+blank lines and lines starting with `#` ignored. In-process,
+`checkFloor(floor_text, writer)` returns how many fall under it, printing
+`FLOOR  never reached: <message>` for a MISS on it and
+`STALE  on the floor, but no such property: <message>` for a line naming no
+site in this program. It ignores FAILs, which are `report`'s. Out of process,
+`tools/report.py --floor floor.txt` reads the same file and also exits 1 on a
+floor MISS or a stale line.
 
 ## The numeric comparisons, on the wire
 
@@ -154,11 +183,13 @@ declared once a run with `hit: false` and no data, as every site is.
 
 **When a guidance line goes out is this SDK's rule**: the first call, and
 every call nearer the edge than any before it in this run. The Go SDK keeps
-the same extreme per assertion, but its tracker's source was not to hand
-when this was written, so the exact rule there may differ.
+the same extreme per assertion; whether it emits on the same rule is
+unchecked.
 
-`tools/report.py` reads many runs at once (metal-vmm's `metal_vmm_run`
-lines name them; a file without them is a run per boot) and says, for each
+`tools/report.py` reads many runs at once. A run is a line metal-vmm writes
+before its guest's output, such as
+`{"metal_vmm_run":{"seed":4711,"knobs":"WIRE_EAT=3"}}`, and what follows it;
+a file without such lines is a run per boot. It says, for each
 property, how many runs reached it and which first, for each comparison the
 nearest any run came to its edge and which run, and the properties only one
 run ever reached. `python3 tools/report_test.py` is its own test.
