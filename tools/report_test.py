@@ -50,7 +50,7 @@ def boot(*hits):
 
 
 class Report(unittest.TestCase):
-    def judge(self, *files, floor=None, edges=None):
+    def judge(self, *files, floor=None, edges=None, against=None):
         paths = []
         with tempfile.TemporaryDirectory() as d:
             for i, events in enumerate(files):
@@ -71,9 +71,16 @@ class Report(unittest.TestCase):
                 with open(ep, "w") as f:
                     f.write(edges)
                 ed = report.read_edges(ep)
+            there = []
+            for i, events in enumerate(against or []):
+                p = os.path.join(d, f"there{i}.jsonl")
+                with open(p, "w") as f:
+                    for e in events:
+                        f.write(json.dumps(e) + "\n")
+                there.append(p)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = report.main(paths, fl, ed)
+                code = report.main(paths, fl, ed, there or None)
             return code, out.getvalue().replace(d + "/", "")
 
     def line(self, text, prop):
@@ -165,6 +172,24 @@ class Report(unittest.TestCase):
                 f.write("slots at least 64\n")
             with self.assertRaises(SystemExit):
                 report.read_edges(ep)
+
+    def test_against_another_image(self):
+        here = [run(1)] + boot(assertion("syn", "Sometimes", True, True),
+                               assertion("rto capped", "Always", True, False),
+                               guidance("slots", True, 2, 2), guidance("slots", True, 40, 40))
+        there = [run(1)] + boot(assertion("rare one", "Reachable", True, True),
+                                assertion("rto capped", "Always", True, True),
+                                guidance("slots", True, 2, 2))
+        code, text = self.judge(here, against=[there])
+        self.assertEqual(code, 1)  # the first set's own verdict: rto capped broke here
+        self.assertIn("against 1 other runs:", text)
+        self.assertIn("  reached here, not there:\n       syn", text)
+        self.assertIn("  reached there, not here:\n       rare one", text)
+        self.assertIn("ok -> FAIL  rto capped", text)
+        self.assertIn("reach: left 2 -> 40  slots", text)
+        # The same runs against themselves: nothing differs.
+        _, text = self.judge(here, against=[here])
+        self.assertIn("  no difference", text)
 
     def test_long_sh_reads_the_same_lines(self):
         # gopher-metal's long.sh keeps only these: the verdict prefixes, the

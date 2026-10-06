@@ -5,6 +5,7 @@ property is its `id`; its sites are declared (`hit: false`) by each run, and
 a run reports the first pass and the first failure of each.
 
     tools/report.py <a.jsonl> [b.jsonl ...] [--floor <file>] [--edges <file>]
+                    [--against <c.jsonl> [d.jsonl ...]]
 
 FAIL is a property the runs broke: an Always or AlwaysOrUnreachable seen
 false, an Unreachable reached. MISS is one they never got to: a Sometimes
@@ -41,6 +42,12 @@ one line each, the message, then `>=` or `<=` and a number, `#` for comments:
 minimizes by its least. A comparison that never reached the number fails
 (EDGE), and so does a line naming no comparison any run declared, or one
 whose sign is not the way that comparison steers (STALE).
+
+**ONE REPORT, TWO IMAGES** (`--against`): every file after it is a second set
+of runs, such as the same seeds against the image before. After the report,
+the difference: the properties one set reached and the other did not, the
+verdicts that differ, and the edges and reaches that moved. It changes
+nothing about the exit status, which is the first set's.
 """
 import re
 import json
@@ -169,7 +176,56 @@ class Runs:
             self.reaches[g["id"]] = {"left": left, "right": right, "run": run, "maximize": maximize}
 
 
-def main(paths, floor=None, edges=None):
+def verdict(p):
+    """ok, MISS or FAIL, for one property's counts."""
+    d, t, f = p["display"], p["true"], p["false"]
+    ok = {
+        "Always": t + f > 0 and f == 0,
+        "AlwaysOrUnreachable": f == 0,
+        "Unreachable": f == 0,
+        "Sometimes": t > 0,
+        "Reachable": t > 0,
+    }[d]
+    if ok:
+        return "ok"
+    return "FAIL" if d in MUST_HOLD and f > 0 else "MISS"
+
+
+def reached(p):
+    return p["true"] + p["false"] > 0
+
+
+def against(here, there):
+    """The difference between two sets of runs, as lines."""
+    out = [f"against {len(there.names)} other runs:"]
+    a, b = here.props, there.props
+    only_here = sorted(i for i in a if reached(a[i]) and not (i in b and reached(b[i])))
+    only_there = sorted(i for i in b if reached(b[i]) and not (i in a and reached(a[i])))
+    changed = sorted(i for i in a if i in b and verdict(a[i]) != verdict(b[i]))
+    for title, ids in (("reached here, not there", only_here), ("reached there, not here", only_there)):
+        if ids:
+            out.append(f"  {title}:")
+            out += [f"       {i}" for i in ids]
+    if changed:
+        out.append("  verdicts that differ (there -> here):")
+        out += [f"       {verdict(b[i])} -> {verdict(a[i])}  {i}" for i in changed]
+    moved = []
+    for kind, ha, hb in (("edge", here.edges, there.edges), ("reach", here.reaches, there.reaches)):
+        for i in sorted(set(ha) & set(hb)):
+            if ha[i]["left"] != hb[i]["left"]:
+                moved.append(f"       {kind}: left {hb[i]['left']} -> {ha[i]['left']}  {i}")
+    if moved:
+        out.append("  edges and reaches that moved (there -> here):")
+        out += moved
+    declared_only = sorted(set(a) ^ set(b))
+    if declared_only:
+        out.append(f"  {len(declared_only)} properties declared by one set only (a different image's sources)")
+    if len(out) == 1:
+        out.append("  no difference")
+    return out
+
+
+def main(paths, floor=None, edges=None, there_paths=None):
     runs = Runs()
     for path in paths:
         runs.read(path)
@@ -243,6 +299,12 @@ def main(paths, floor=None, edges=None):
             short += 1
     if short:
         print(f"short of the edge floor: {short}")
+    if there_paths:
+        there = Runs()
+        for path in there_paths:
+            there.read(path)
+        for line in against(runs, there):
+            print(line)
     return 1 if broken or under or stale or short else 0
 
 
@@ -250,6 +312,13 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     floor = None
     edges = None
+    there = None
+    if "--against" in args:
+        at = args.index("--against")
+        there = args[at + 1:]
+        args = args[:at]
+        if not there:
+            sys.exit(__doc__)
     for flag in ("--floor", "--edges"):
         if flag in args:
             at = args.index(flag)
@@ -262,4 +331,4 @@ if __name__ == "__main__":
             args = args[:at] + args[at + 2:]
     if not args:
         sys.exit(__doc__)
-    sys.exit(main(args, floor, edges))
+    sys.exit(main(args, floor, edges, there))

@@ -197,6 +197,13 @@ print both, and `report.py --edges <file>` is a floor for reaches: a line
 comparison's reach never got there (EDGE), and a line naming no comparison,
 or with the sign against the way it steers, is STALE.
 
+**One report, two images.** `report.py a.jsonl ... --against b.jsonl ...`
+ends with the difference between the two sets of runs: the properties one
+reached and the other did not, the verdicts that differ, and the edges and
+reaches that moved. The same seeds on two images (v17 and v18, say) show
+what the change did to the kernel's own properties. The exit status is the
+first set's.
+
 `tools/report.py` reads many runs at once. A run is a line metal-vmm writes
 before its guest's output, such as
 `{"metal_vmm_run":{"seed":4711,"knobs":"WIRE_EAT=3"}}`, and what follows it;
