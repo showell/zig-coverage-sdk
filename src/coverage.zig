@@ -357,7 +357,14 @@ pub fn register(comptime src: std.builtin.SourceLocation, comptime kind: Kind, c
 /// (`@src()` is refused outside a function.) Its sites are then in the
 /// catalog of every program that compiles the file, even the ones in
 /// functions nothing calls; build.zig's `addCatalog` makes the module.
+///
+/// **A FILE OF MANY SITES NEEDS MORE COMPTIME THAN ZIG'S DEFAULT.** Every site
+/// is registered in one comptime evaluation, each costing some hundreds of
+/// branches (its function's name searched, its strings copied and hashed), so
+/// a file past about seventy sites ran out of the default 1000 (gopher-metal's
+/// fat16.zig, metal-vmm QUEUE item 76). The quota is a ceiling, not a cost.
 pub fn catalogFile(comptime generated: type, comptime here: std.builtin.SourceLocation) void {
+    @setEvalBranchQuota(10_000_000);
     generated.sites(here.module, here.file);
 }
 
