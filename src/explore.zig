@@ -100,7 +100,7 @@ pub const Tape = struct {
 
     /// Rewrites fill `i`, one `uintLessThan(Draw, total)` drawn in one fill,
     /// to bytes that draw `want`.
-    fn rewrite(t: *Tape, i: u32, comptime Draw: type, total: u32, want: u32) void {
+    fn rewrite(t: *Tape, i: u32, comptime Draw: type, total: u64, want: u64) void {
         const start = if (i == 0) 0 else t.ends.items[i - 1];
         const slot = t.bytes.items[start..t.ends.items[i]];
         if (slot.len != @sizeOf(Draw)) {
@@ -110,9 +110,9 @@ pub const Tape = struct {
         // The value `uintLessThan` maps to `want` is near `want`'s share of
         // the range; try it and its neighbours, keeping one that is drawn in
         // a single fill.
-        const span: u64 = @as(u64, std.math.maxInt(Draw)) + 1;
-        const guess: u64 = (@as(u64, want) * span + total - 1) / total;
-        var k: u64 = 0;
+        const span: u128 = @as(u128, std.math.maxInt(Draw)) + 1;
+        const guess: u128 = (@as(u128, want) * span + total - 1) / total;
+        var k: u128 = 0;
         while (k < 4) : (k += 1) {
             const x: Draw = @intCast(@min(guess + k, span - 1));
             var one = Single{ .bytes = std.mem.asBytes(&x) };
@@ -123,6 +123,29 @@ pub const Tape = struct {
             }
         }
         t.unfaithful = true;
+    }
+
+    /// Rewrites fill `i`, one `boolean()` drawn in one fill, to draw `want`.
+    fn rewriteFlag(t: *Tape, i: u32, want: bool) void {
+        const start = if (i == 0) 0 else t.ends.items[i - 1];
+        const slot = t.bytes.items[start..t.ends.items[i]];
+        const x: u8 = @intFromBool(want);
+        var one = Single{ .bytes = std.mem.asBytes(&x) };
+        if (slot.len == 1 and one.random().boolean() == want and one.used == 1) slot[0] = x else t.unfaithful = true;
+    }
+
+    /// Logs a named choice, and answers the alternative the run takes: the
+    /// forced one if the explorer forced this choice, else `drawn`.
+    fn named(t: *Tape, name: []const u8, at: u32, drawn: u32, alternatives: u32) ?u32 {
+        const index: u32 = @intCast(t.choices.items.len);
+        var chosen = drawn;
+        var forced: ?u32 = null;
+        if (t.force) |force| if (force.index == index and force.alternative < alternatives and force.alternative != drawn) {
+            chosen = force.alternative;
+            forced = chosen;
+        };
+        t.choices.append(t.gpa, .{ .name = name, .position = at, .chosen = chosen, .alternatives = alternatives }) catch {};
+        return forced;
     }
 
     /// The bytes of fill `i`.
@@ -179,43 +202,56 @@ const Single = struct {
 /// .yes = 1 })` answers `.no` or `.yes`. The alternatives take the draw's
 /// values in field order. One draw, whatever the source: `uintLessThan(u8,
 /// total)` when the total fits a byte (else `u32`), so a pick can replace an
-/// existing `uintLessThan(u8, n)` without changing a seed's run. Under a
-/// `Tape` the choice is logged, and a forced one takes the forced alternative
-/// after drawing all the same.
+/// existing `uintLessThan(u8, n)` without changing a seed's run; `pickAs`
+/// names the type when the existing draw is another. Under a `Tape` the
+/// choice is logged, and a forced one takes the forced alternative, with the
+/// draw on the tape rewritten to one that gives it, so replaying the tape (a
+/// twin, a reproduction) takes the flip too.
 pub fn pick(r: std.Random, comptime name: []const u8, comptime weights: anytype) std.meta.FieldEnum(@TypeOf(weights)) {
+    comptime var total: u64 = 0;
+    inline for (@typeInfo(@TypeOf(weights)).@"struct".fields) |f| total += @field(weights, f.name);
+    return pickAs(r, if (total <= 255) u8 else u32, name, weights);
+}
+
+/// `pick`, drawn as `uintLessThan(Draw, total)`.
+pub fn pickAs(r: std.Random, comptime Draw: type, comptime name: []const u8, comptime weights: anytype) std.meta.FieldEnum(@TypeOf(weights)) {
     const fields = @typeInfo(@TypeOf(weights)).@"struct".fields;
-    comptime var total: u32 = 0;
-    inline for (fields) |f| total += @field(weights, f.name);
+    const starts = comptime blk: {
+        var at: [fields.len + 1]u64 = undefined;
+        var sum: u64 = 0;
+        for (fields, 0..) |f, i| {
+            at[i] = sum;
+            sum += @field(weights, f.name);
+        }
+        at[fields.len] = sum;
+        break :blk at;
+    };
+    const total = starts[fields.len];
     const tape = Tape.of(r);
     const at: u32 = if (tape) |t| t.position() else 0;
-    const Draw = if (total <= 255) u8 else u32;
-    const draw: u32 = r.uintLessThan(Draw, total);
+    const draw: u64 = r.uintLessThan(Draw, total);
     var chosen: u32 = 0;
-    var below: u32 = 0;
-    inline for (fields, 0..) |f, i| {
-        below += @field(weights, f.name);
-        if (draw >= below) chosen = i + 1;
+    inline for (1..fields.len) |i| {
+        if (draw >= starts[i]) chosen = i;
     }
-    if (tape) |t| {
-        const index: u32 = @intCast(t.choices.items.len);
-        if (t.force) |force| if (force.index == index and force.alternative < fields.len and force.alternative != chosen) {
-            chosen = force.alternative;
-            // **THE TAPE SAYS WHAT THE RUN DID**: the draw is rewritten to
-            // one that gives the forced alternative, so replaying this tape
-            // (a twin, a reproduction) takes the flip too.
-            comptime var starts: [fields.len]u32 = undefined;
-            comptime {
-                var sum: u32 = 0;
-                for (fields, 0..) |f, i| {
-                    starts[i] = sum;
-                    sum += @field(weights, f.name);
-                }
-            }
-            if (t.position() == at + 1) t.rewrite(at, Draw, total, starts[chosen]) else t.unfaithful = true;
-        };
-        t.choices.append(t.gpa, .{ .name = name, .position = at, .chosen = chosen, .alternatives = fields.len }) catch {};
-    }
+    if (tape) |t| if (t.named(name, at, chosen, fields.len)) |forced| {
+        chosen = forced;
+        if (t.position() == at + 1) t.rewrite(at, Draw, total, @intCast(starts[forced])) else t.unfaithful = true;
+    };
     return @enumFromInt(chosen);
+}
+
+/// **A NAMED YES OR NO**, drawn exactly as `r.boolean()`, so it can replace
+/// one without changing a seed's run.
+pub fn flag(r: std.Random, comptime name: []const u8) bool {
+    const tape = Tape.of(r);
+    const at: u32 = if (tape) |t| t.position() else 0;
+    var yes = r.boolean();
+    if (tape) |t| if (t.named(name, at, @intFromBool(yes), 2)) |forced| {
+        yes = forced == 1;
+        if (t.position() == at + 1) t.rewriteFlag(at, yes) else t.unfaithful = true;
+    };
+    return yes;
 }
 
 // ── the explorer ────────────────────────────────────────────────────────────
@@ -523,6 +559,49 @@ test "a flipped tape, replayed, takes the flip" {
         try story(again.random(), &d);
         try testing.expectEqualSlices(u64, b.items, d.items);
         try testing.expectEqual(1 - c.chosen, again.choices.items[0].chosen);
+    }
+}
+
+fn wide(r: std.Random, out: *std.ArrayList(u64)) !void {
+    try out.append(testing.allocator, r.int(u16));
+    const k = pickAs(r, usize, "wide: one of fourteen", .{ .a = 1, .b = 1, .c = 1, .d = 1, .e = 1, .f = 1, .g = 1, .h = 1, .i = 1, .j = 1, .k = 1, .l = 1, .m = 1, .n = 1 });
+    try out.append(testing.allocator, @intFromEnum(k));
+    const y = flag(r, "wide: yes");
+    try out.append(testing.allocator, @intFromBool(y));
+    for (0..@as(usize, if (y) 9 else 2) + @intFromEnum(k)) |_| try out.append(testing.allocator, r.uintLessThan(u64, 77));
+}
+
+test "pickAs and flag draw as the calls they replace, and their flips replay" {
+    for (0..100) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        _ = r.int(u16);
+        const plain_k = r.uintLessThan(usize, 14);
+        const plain_y = r.boolean();
+        var tape = Tape.init(testing.allocator, seed);
+        defer tape.deinit();
+        var a: std.ArrayList(u64) = .empty;
+        defer a.deinit(testing.allocator);
+        try wide(tape.random(), &a);
+        try testing.expectEqual(@as(u64, plain_k), a.items[1]);
+        try testing.expectEqual(@as(u64, @intFromBool(plain_y)), a.items[2]);
+
+        for (tape.choices.items, 0..) |c, index| {
+            const alt: u32 = (c.chosen + 1 + @as(u32, @intCast(seed % (c.alternatives - 1)))) % c.alternatives;
+            var flipped = Tape.branch(testing.allocator, &tape, c.position, seed + 1, .{ .index = @intCast(index), .alternative = alt });
+            defer flipped.deinit();
+            var b: std.ArrayList(u64) = .empty;
+            defer b.deinit(testing.allocator);
+            try wide(flipped.random(), &b);
+            try testing.expect(!flipped.unfaithful);
+            try testing.expectEqual(alt, flipped.choices.items[index].chosen);
+            var again = Tape.branch(testing.allocator, &flipped, flipped.position(), seed + 2, null);
+            defer again.deinit();
+            var d: std.ArrayList(u64) = .empty;
+            defer d.deinit(testing.allocator);
+            try wide(again.random(), &d);
+            try testing.expectEqualSlices(u64, b.items, d.items);
+        }
     }
 }
 
