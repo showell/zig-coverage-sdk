@@ -270,6 +270,11 @@ pub const Options = struct {
     /// Of the rest, the share that flip one named choice (SAGE's move); the
     /// others re-roll the future from a point in a run (Antithesis's).
     flip: f32 = 0.5,
+    /// **AIMED FLIPS**: flip toward the alternative of a named choice that
+    /// runs have taken least, and count a run that takes one never taken
+    /// before as new. False: a flip picks its choice and alternative at
+    /// random.
+    aim: bool = true,
 };
 
 /// How a run was made.
@@ -279,6 +284,8 @@ pub const Move = enum { blind, branch, flip };
 pub const Report = struct {
     runs: u32 = 0,
     corpus: u32 = 0,
+    /// Alternatives of named choices taken for the first time.
+    decisions: u32 = 0,
     by_move: [3]u32 = @splat(0),
     /// Runs that found something new to the explorer, by move.
     new_by_move: [3]u32 = @splat(0),
@@ -350,6 +357,14 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
     }
     var hits: std.ArrayList(u32) = .empty;
     defer hits.deinit(gpa);
+    // How often each alternative of each named choice has been taken, by
+    // every run of this exploration: the branches of the named decisions.
+    var taken: std.StringHashMap([]u32) = .init(gpa);
+    defer {
+        var vit = taken.valueIterator();
+        while (vit.next()) |v| gpa.free(v.*);
+        taken.deinit();
+    }
 
     while (report.runs < options.budget) : (report.runs += 1) {
         const fresh = r.int(u64);
@@ -359,11 +374,12 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
         else blk: {
             const from = &corpus.items[pickEntry(r, corpus.items, reached_by)].tape;
             if (from.choices.items.len > 0 and r.float(f32) < options.flip) {
-                const index = r.uintLessThan(usize, from.choices.items.len);
+                const aimed = if (options.aim) aimFlip(r, from.choices.items, &taken) else null;
+                const index = if (aimed) |a| a.index else r.uintLessThan(usize, from.choices.items.len);
                 const c = from.choices.items[index];
                 if (c.alternatives > 1) {
-                    var alt = r.uintLessThan(u32, c.alternatives - 1);
-                    if (alt >= c.chosen) alt += 1;
+                    var alt = if (aimed) |a| a.alternative else r.uintLessThan(u32, c.alternatives - 1);
+                    if (aimed == null and alt >= c.chosen) alt += 1;
                     move = .flip;
                     break :blk Tape.branch(gpa, from, c.position, fresh, .{ .index = @intCast(index), .alternative = alt });
                 }
@@ -391,6 +407,20 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
             if (site.fails > 0 and b.fails == 0) new = true;
             if (!std.meta.eql(site.reach, b.reach) or !std.meta.eql(site.edge, b.edge)) new = true;
         }
+        for (tape.choices.items) |c| {
+            const counts = taken.get(c.name) orelse blk: {
+                const fresh_counts = try gpa.alloc(u32, c.alternatives);
+                @memset(fresh_counts, 0);
+                try taken.put(c.name, fresh_counts);
+                break :blk fresh_counts;
+            };
+            if (c.chosen >= counts.len) continue;
+            if (counts[c.chosen] == 0) {
+                new = true;
+                report.decisions += 1;
+            }
+            counts[c.chosen] += 1;
+        }
         if (failed) {
             keep = true;
             try report.failures.append(gpa, tape);
@@ -405,6 +435,41 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
     }
     report.corpus = @intCast(corpus.items.len);
     return report;
+}
+
+/// **WHERE TO FLIP, AIMED**: among a run's named choices, the one whose
+/// least-taken other alternative has been taken least, weighted so a choice
+/// never flipped that way is likeliest; and that alternative.
+fn aimFlip(r: std.Random, choices: []const Choice, taken: *const std.StringHashMap([]u32)) ?Force {
+    var total: f64 = 0;
+    for (choices) |c| total += aimWeight(c, taken).weight;
+    if (total <= 0) return null;
+    var at = r.float(f64) * total;
+    for (choices, 0..) |c, i| {
+        const w = aimWeight(c, taken);
+        at -= w.weight;
+        if (at <= 0 and w.weight > 0) return .{ .index = @intCast(i), .alternative = w.alternative };
+    }
+    return null;
+}
+
+fn aimWeight(c: Choice, taken: *const std.StringHashMap([]u32)) struct { weight: f64, alternative: u32 } {
+    if (c.alternatives < 2) return .{ .weight = 0, .alternative = 0 };
+    const counts = taken.get(c.name) orelse return .{ .weight = 1, .alternative = if (c.chosen == 0) 1 else 0 };
+    var best: u32 = std.math.maxInt(u32);
+    var alt: u32 = 0;
+    var a: u32 = 0;
+    while (a < c.alternatives) : (a += 1) {
+        if (a == c.chosen) continue;
+        const n = if (a < counts.len) counts[a] else 0;
+        if (n < best) {
+            best = n;
+            alt = a;
+        }
+    }
+    // A never-taken alternative weighs most, falling with the square of
+    // how often it has been taken.
+    return .{ .weight = 1.0 / (1.0 + @as(f64, @floatFromInt(best)) * @as(f64, @floatFromInt(best))), .alternative = alt };
 }
 
 /// A corpus run, weighted by what it reached that few others did: each site
@@ -661,4 +726,12 @@ test "an exploration repeats exactly" {
     try testing.expectEqual(a.corpus, b.corpus);
     try testing.expectEqualSlices(u32, &a.by_move, &b.by_move);
     try testing.expectEqualSlices(u32, &a.new_by_move, &b.new_by_move);
+}
+
+test "aimed flips open three rare doors in a few runs" {
+    coverage.reset();
+    var aimed = try explore(testing.allocator, deep, .{ .budget = 30, .seed = 4, .blind = 0.0 });
+    defer aimed.deinit(testing.allocator);
+    try testing.expect(deepSite().hit());
+    try testing.expect(aimed.decisions >= 6);
 }
