@@ -54,8 +54,12 @@ pub const Tape = struct {
     replay_from: u32 = 0,
     /// A replayed fill whose length differed from the recorded one: the run
     /// went another way than the tape it replays, so its past is not that
-    /// tape's. Fresh bytes answer it, and this says it happened.
+    /// tape's. Fresh bytes answer it and every fill after it (a past that
+    /// has come apart is not replayed further), and this says it happened.
     drifted: bool = false,
+    /// The record stopped (out of memory): `bytes` and `ends` hold the fills
+    /// up to there, consistently, and the run goes on unrecorded.
+    truncated: bool = false,
     force: ?Force = null,
     /// A forced choice whose draw could not be rewritten (it took more than
     /// one fill), so replaying this tape does not take the flip.
@@ -167,7 +171,7 @@ pub const Tape = struct {
         const t: *Tape = @ptrCast(@alignCast(ptr));
         const at = t.position();
         answer: {
-            if (t.replay) |old| if (at < t.replay_upto) {
+            if (t.replay) |old| if (!t.drifted and at < t.replay_upto) {
                 const was = old.fillAt(t.replay_from + at);
                 if (was.len == buf.len) {
                     @memcpy(buf, was);
@@ -178,9 +182,19 @@ pub const Tape = struct {
             t.prng.random().bytes(buf);
         }
         // Out of memory ends the run's record, not the run: the draw is
-        // answered either way, and a short tape only replays less.
-        t.bytes.appendSlice(t.gpa, buf) catch return;
-        t.ends.append(t.gpa, @intCast(t.bytes.items.len)) catch return;
+        // answered either way, and a short tape only replays less. Room for
+        // both is made first, so the two lists never fall out of step.
+        if (t.truncated) return;
+        t.bytes.ensureUnusedCapacity(t.gpa, buf.len) catch {
+            t.truncated = true;
+            return;
+        };
+        t.ends.ensureUnusedCapacity(t.gpa, 1) catch {
+            t.truncated = true;
+            return;
+        };
+        t.bytes.appendSliceAssumeCapacity(buf);
+        t.ends.appendAssumeCapacity(@intCast(t.bytes.items.len));
     }
 };
 
@@ -200,7 +214,9 @@ const Single = struct {
 /// **A NAMED CHOICE** among the fields of `weights`, an anonymous struct of
 /// comptime integer weights: `pick(r, "fat: the volume is FAT32", .{ .no = 3,
 /// .yes = 1 })` answers `.no` or `.yes`. The alternatives take the draw's
-/// values in field order. One draw, whatever the source: `uintLessThan(u8,
+/// values in field order, so **replacing `uintLessThan(u8, 4) == 0` keeps a
+/// seed's run only as `.{ .yes = 1, .no = 3 }`**: the alternative the old
+/// test took on 0 comes first. One draw, whatever the source: `uintLessThan(u8,
 /// total)` when the total fits a byte (else `u32`), so a pick can replace an
 /// existing `uintLessThan(u8, n)` without changing a seed's run; `pickAs`
 /// names the type when the existing draw is another. Under a `Tape` the
@@ -286,6 +302,11 @@ pub const Report = struct {
     corpus: u32 = 0,
     /// Alternatives of named choices taken for the first time.
     decisions: u32 = 0,
+    /// Runs whose replay came apart from the tape they replayed: their
+    /// moves are counted as made, but what they did was closer to a blind
+    /// run. A simulator whose runs drift is not a function of its tape, and
+    /// a benchmark of it is not one of steering.
+    drifted: u32 = 0,
     by_move: [3]u32 = @splat(0),
     /// Runs that found something new to the explorer, by move.
     new_by_move: [3]u32 = @splat(0),
@@ -389,6 +410,12 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
         };
         var keep = false;
         defer if (!keep) tape.deinit();
+        // A tape kept points at no other: the corpus moves and is freed.
+        defer if (keep) {
+            tape.replay = null;
+            tape.replay_upto = 0;
+            tape.replay_from = 0;
+        };
         report.by_move[@intFromEnum(move)] += 1;
 
         for (sites.items, before) |site, *b| b.* = .{ .passes = site.passes, .fails = site.fails, .reach = site.reach, .edge = site.edge };
@@ -407,6 +434,7 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
             if (site.fails > 0 and b.fails == 0) new = true;
             if (!std.meta.eql(site.reach, b.reach) or !std.meta.eql(site.edge, b.edge)) new = true;
         }
+        if (tape.drifted) report.drifted += 1;
         for (tape.choices.items) |c| {
             const counts = taken.get(c.name) orelse blk: {
                 const fresh_counts = try gpa.alloc(u32, c.alternatives);
@@ -734,4 +762,42 @@ test "aimed flips open three rare doors in a few runs" {
     defer aimed.deinit(testing.allocator);
     try testing.expect(deepSite().hit());
     try testing.expect(aimed.decisions >= 6);
+}
+
+/// A "simulator" that is not a function of its tape: every other call draws
+/// one byte more.
+var odd_calls: u32 = 0;
+fn unsteady(tape: *Tape) anyerror!void {
+    const r = tape.random();
+    odd_calls +%= 1;
+    if (odd_calls % 2 == 0) _ = r.int(u8);
+    _ = pick(r, "unsteady: a door", .{ .shut = 3, .open = 1 });
+    for (0..5) |_| _ = r.int(u32);
+}
+
+test "a run that drifts from the tape it replays is counted, and replays no further" {
+    coverage.reset();
+    odd_calls = 0;
+    var report = try explore(testing.allocator, unsteady, .{ .budget = 200, .seed = 3, .blind = 0.2 });
+    defer report.deinit(testing.allocator);
+    try testing.expect(report.drifted > 0);
+
+    // A replay that drifts at its first fill answers every later one fresh.
+    var first = Tape.init(testing.allocator, 1);
+    defer first.deinit();
+    const r1 = first.random();
+    _ = r1.int(u8);
+    _ = r1.int(u32);
+    var again = Tape.branch(testing.allocator, &first, first.position(), 99, null);
+    defer again.deinit();
+    const r2 = again.random();
+    const x = r2.int(u32); // four bytes where the tape has one: drift
+    _ = x;
+    try testing.expect(again.drifted);
+    const y = r2.int(u32); // the tape's second fill is four bytes too, but is not replayed
+    var fresh = Tape.init(testing.allocator, 99);
+    defer fresh.deinit();
+    const f = fresh.random();
+    _ = f.int(u32);
+    try testing.expectEqual(f.int(u32), y);
 }
