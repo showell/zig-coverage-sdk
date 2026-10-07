@@ -203,7 +203,7 @@ pub const Operands = extern struct {
 
     /// Whether `o`'s left is further than `reach`'s, which way `maximize`
     /// says.
-    fn further(o: Operands, reach: Operands, maximize: bool) bool {
+    pub fn further(o: Operands, reach: Operands, maximize: bool) bool {
         if (reach.what == .none) return true;
         return switch (o.what) {
             .signed => if (maximize) @as(i64, @bitCast(o.left)) > @as(i64, @bitCast(reach.left)) else @as(i64, @bitCast(o.left)) < @as(i64, @bitCast(reach.left)),
@@ -214,7 +214,7 @@ pub const Operands = extern struct {
     }
 
     /// Whether `o` is nearer the edge than `edge`, which way `maximize` says.
-    fn nearer(o: Operands, edge: Operands, maximize: bool) bool {
+    pub fn nearer(o: Operands, edge: Operands, maximize: bool) bool {
         if (edge.what == .none) return true;
         const a = o.gap();
         const b = edge.gap();

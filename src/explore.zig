@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const coverage = @import("coverage");
 
 /// One named choice a run made: where in the tape it was drawn, and which
 /// alternative it took out of how many.
@@ -36,6 +37,8 @@ pub const Force = struct {
 
 pub const Tape = struct {
     gpa: Allocator,
+    /// The seed fresh draws come from, for a run's report.
+    seed: u64,
     prng: std.Random.DefaultPrng,
     /// Every fill answered, end to end, and where each one ends in `bytes`.
     bytes: std.ArrayList(u8) = .empty,
@@ -46,6 +49,9 @@ pub const Tape = struct {
     /// again, byte for byte.
     replay: ?*const Tape = null,
     replay_upto: u32 = 0,
+    /// Replayed fill `i` is `replay`'s fill `replay_from + i`: a twin run
+    /// can replay the stretch of a tape its first run drew.
+    replay_from: u32 = 0,
     /// A replayed fill whose length differed from the recorded one: the run
     /// went another way than the tape it replays, so its past is not that
     /// tape's. Fresh bytes answer it, and this says it happened.
@@ -55,7 +61,7 @@ pub const Tape = struct {
     /// A tape that draws from `seed`: a run under it is the run `seed`'s
     /// PRNG gives, recorded.
     pub fn init(gpa: Allocator, seed: u64) Tape {
-        return .{ .gpa = gpa, .prng = .init(seed) };
+        return .{ .gpa = gpa, .seed = seed, .prng = .init(seed) };
     }
 
     /// A tape that answers `old`'s first `upto` fills again, then draws from
@@ -65,6 +71,17 @@ pub const Tape = struct {
         t.replay = old;
         t.replay_upto = @min(upto, old.position());
         t.force = force;
+        return t;
+    }
+
+    /// A tape that answers `old`'s fills `from` to `to` again, in order,
+    /// then draws from `seed`: the same draws, for a second run of the same
+    /// story (a twin that must reach the same end by another road).
+    pub fn twin(gpa: Allocator, old: *const Tape, from: u32, to: u32, seed: u64) Tape {
+        var t = init(gpa, seed);
+        t.replay = old;
+        t.replay_from = @min(from, old.position());
+        t.replay_upto = @min(to, old.position()) -| t.replay_from;
         return t;
     }
 
@@ -98,7 +115,7 @@ pub const Tape = struct {
         const at = t.position();
         answer: {
             if (t.replay) |old| if (at < t.replay_upto) {
-                const was = old.fillAt(at);
+                const was = old.fillAt(t.replay_from + at);
                 if (was.len == buf.len) {
                     @memcpy(buf, was);
                     break :answer;
@@ -116,16 +133,20 @@ pub const Tape = struct {
 
 /// **A NAMED CHOICE** among the fields of `weights`, an anonymous struct of
 /// comptime integer weights: `pick(r, "fat: the volume is FAT32", .{ .no = 3,
-/// .yes = 1 })` answers `.no` or `.yes`. One draw, as `uintLessThan` over the
-/// total weight, whatever the source; under a `Tape` the choice is logged,
-/// and a forced one takes the forced alternative after drawing all the same.
+/// .yes = 1 })` answers `.no` or `.yes`. The alternatives take the draw's
+/// values in field order. One draw, whatever the source: `uintLessThan(u8,
+/// total)` when the total fits a byte (else `u32`), so a pick can replace an
+/// existing `uintLessThan(u8, n)` without changing a seed's run. Under a
+/// `Tape` the choice is logged, and a forced one takes the forced alternative
+/// after drawing all the same.
 pub fn pick(r: std.Random, comptime name: []const u8, comptime weights: anytype) std.meta.FieldEnum(@TypeOf(weights)) {
     const fields = @typeInfo(@TypeOf(weights)).@"struct".fields;
     comptime var total: u32 = 0;
     inline for (fields) |f| total += @field(weights, f.name);
     const tape = Tape.of(r);
     const at: u32 = if (tape) |t| t.position() else 0;
-    const draw = r.uintLessThan(u32, total);
+    const Draw = if (total <= 255) u8 else u32;
+    const draw: u32 = r.uintLessThan(Draw, total);
     var chosen: u32 = 0;
     var below: u32 = 0;
     inline for (fields, 0..) |f, i| {
@@ -140,6 +161,178 @@ pub fn pick(r: std.Random, comptime name: []const u8, comptime weights: anytype)
         t.choices.append(t.gpa, .{ .name = name, .position = at, .chosen = chosen, .alternatives = fields.len }) catch {};
     }
     return @enumFromInt(chosen);
+}
+
+// ── the explorer ────────────────────────────────────────────────────────────
+
+/// One run of a simulator, its whole story drawn from the tape it is given.
+/// An error is an oracle that failed.
+pub const RunFn = *const fn (tape: *Tape) anyerror!void;
+
+pub const Options = struct {
+    /// How many runs.
+    budget: u32,
+    /// The explorer's own seed: an exploration repeats exactly.
+    seed: u64,
+    /// The share of runs that are blind: a fresh seed, as `properties` runs.
+    blind: f32 = 0.2,
+    /// Of the rest, the share that flip one named choice (SAGE's move); the
+    /// others re-roll the future from a point in a run (Antithesis's).
+    flip: f32 = 0.5,
+};
+
+/// How a run was made.
+pub const Move = enum { blind, branch, flip };
+
+/// What an exploration found, for its report.
+pub const Report = struct {
+    runs: u32 = 0,
+    corpus: u32 = 0,
+    by_move: [3]u32 = @splat(0),
+    /// Runs that found something new to the explorer, by move.
+    new_by_move: [3]u32 = @splat(0),
+    /// The tapes of runs whose oracle failed, in the order found. The
+    /// caller owns them (`deinit`).
+    failures: std.ArrayList(Tape) = .empty,
+    /// Per catalog site, in catalog order: the run that first reached it in
+    /// this exploration, and by which move; null if none did.
+    first: []?First = &.{},
+
+    pub const First = struct { run: u32, move: Move };
+
+    pub fn deinit(r: *Report, gpa: Allocator) void {
+        for (r.failures.items) |*t| t.deinit();
+        r.failures.deinit(gpa);
+        gpa.free(r.first);
+    }
+};
+
+const Seen = struct { passes: u32, fails: u32, reach: coverage.Operands, edge: coverage.Operands };
+
+const Entry = struct {
+    tape: Tape,
+    /// Catalog indices of the sites this run reached.
+    hits: []u32,
+};
+
+/// **THE LOOP.** Runs `run` `options.budget` times. A blind run draws from a
+/// fresh seed. Otherwise it starts from a run in the corpus, chosen by the
+/// rarity of what that run reached, and either replays it to a random point
+/// and draws fresh from there, or replays it to one of its named choices,
+/// forces another alternative there, and draws fresh after. A run joins the
+/// corpus if it did something no run before it in this exploration did: a
+/// site reached for the first time, or a comparison's reach or edge moved
+/// (the catalog's own counts say which). Coverage accumulates in the catalog
+/// as for any sweep, so `coverage.report` afterwards judges the whole
+/// exploration.
+pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
+    var report: Report = .{};
+    errdefer report.deinit(gpa);
+    var own = std.Random.DefaultPrng.init(options.seed);
+    const r = own.random();
+
+    var sites: std.ArrayList(*coverage.Site) = .empty;
+    defer sites.deinit(gpa);
+    var it = coverage.catalog();
+    while (it.next()) |site| try sites.append(gpa, site);
+    const n = sites.items.len;
+    report.first = try gpa.alloc(?Report.First, n);
+    @memset(report.first, null);
+    const before = try gpa.alloc(Seen, n);
+    defer gpa.free(before);
+    // How many corpus runs reached each site, for rarity.
+    const reached_by = try gpa.alloc(u32, n);
+    defer gpa.free(reached_by);
+    @memset(reached_by, 0);
+    // Whether any run of this exploration reached each site.
+    const ever = try gpa.alloc(bool, n);
+    defer gpa.free(ever);
+    for (sites.items, ever) |site, *e| e.* = site.hit();
+
+    var corpus: std.ArrayList(Entry) = .empty;
+    defer {
+        for (corpus.items) |*e| {
+            e.tape.deinit();
+            gpa.free(e.hits);
+        }
+        corpus.deinit(gpa);
+    }
+    var hits: std.ArrayList(u32) = .empty;
+    defer hits.deinit(gpa);
+
+    while (report.runs < options.budget) : (report.runs += 1) {
+        const fresh = r.int(u64);
+        var move: Move = .blind;
+        var tape = if (corpus.items.len == 0 or r.float(f32) < options.blind)
+            Tape.init(gpa, fresh)
+        else blk: {
+            const from = &corpus.items[pickEntry(r, corpus.items, reached_by)].tape;
+            if (from.choices.items.len > 0 and r.float(f32) < options.flip) {
+                const index = r.uintLessThan(usize, from.choices.items.len);
+                const c = from.choices.items[index];
+                if (c.alternatives > 1) {
+                    var alt = r.uintLessThan(u32, c.alternatives - 1);
+                    if (alt >= c.chosen) alt += 1;
+                    move = .flip;
+                    break :blk Tape.branch(gpa, from, c.position, fresh, .{ .index = @intCast(index), .alternative = alt });
+                }
+            }
+            move = .branch;
+            break :blk Tape.branch(gpa, from, r.uintAtMost(u32, from.position()), fresh, null);
+        };
+        var keep = false;
+        defer if (!keep) tape.deinit();
+        report.by_move[@intFromEnum(move)] += 1;
+
+        for (sites.items, before) |site, *b| b.* = .{ .passes = site.passes, .fails = site.fails, .reach = site.reach, .edge = site.edge };
+        const failed = if (run(&tape)) false else |_| true;
+
+        hits.clearRetainingCapacity();
+        var new = false;
+        for (sites.items, before, 0..) |site, b, i| {
+            if (site.passes == b.passes and site.fails == b.fails) continue;
+            try hits.append(gpa, @intCast(i));
+            if (!ever[i]) {
+                ever[i] = true;
+                report.first[i] = .{ .run = report.runs, .move = move };
+                new = true;
+            }
+            if (site.fails > 0 and b.fails == 0) new = true;
+            if (!std.meta.eql(site.reach, b.reach) or !std.meta.eql(site.edge, b.edge)) new = true;
+        }
+        if (failed) {
+            keep = true;
+            try report.failures.append(gpa, tape);
+            continue;
+        }
+        if (new) {
+            report.new_by_move[@intFromEnum(move)] += 1;
+            for (hits.items) |i| reached_by[i] += 1;
+            try corpus.append(gpa, .{ .tape = tape, .hits = try gpa.dupe(u32, hits.items) });
+            keep = true;
+        }
+    }
+    report.corpus = @intCast(corpus.items.len);
+    return report;
+}
+
+/// A corpus run, weighted by what it reached that few others did: each site
+/// it reached counts one over the number of corpus runs that reached it.
+fn pickEntry(r: std.Random, corpus: []const Entry, reached_by: []const u32) usize {
+    var total: f64 = 0;
+    for (corpus) |e| total += weight(e, reached_by);
+    var at = r.float(f64) * total;
+    for (corpus, 0..) |e, i| {
+        at -= weight(e, reached_by);
+        if (at <= 0) return i;
+    }
+    return corpus.len - 1;
+}
+
+fn weight(e: Entry, reached_by: []const u32) f64 {
+    var w: f64 = 0.01;
+    for (e.hits) |i| w += 1.0 / @as(f64, @floatFromInt(@max(reached_by[i], 1)));
+    return w;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -260,4 +453,53 @@ test "pick without a tape is a plain weighted choice" {
         if (pick(prng.random(), "plain", .{ .no = 3, .yes = 1 }) == .yes) yes += 1;
     }
     try testing.expect(yes > 800 and yes < 1200);
+}
+
+/// A story whose deepest property needs three rare named choices in a row
+/// (one in sixteen each): blind seeds reach it about one run in 4,096.
+fn deep(tape: *Tape) anyerror!void {
+    const r = tape.random();
+    _ = r.int(u64);
+    if (pick(r, "deep: the first door", .{ .shut = 15, .open = 1 }) == .shut) return;
+    coverage.reachable(@src(), "deep: past the first door", null);
+    _ = r.int(u32);
+    if (pick(r, "deep: the second door", .{ .shut = 15, .open = 1 }) == .shut) return;
+    coverage.reachable(@src(), "deep: past the second door", null);
+    if (pick(r, "deep: the third door", .{ .shut = 15, .open = 1 }) == .shut) return;
+    coverage.reachable(@src(), "deep: past the third door", null);
+}
+
+fn deepSite() *coverage.Site {
+    var it = coverage.catalog();
+    while (it.next()) |site| {
+        if (std.mem.eql(u8, std.mem.span(site.message), "deep: past the third door")) return site;
+    }
+    unreachable;
+}
+
+test "the explorer reaches what three rare choices guard, and blind seeds at the same budget do not" {
+    coverage.reset();
+    var blind = try explore(testing.allocator, deep, .{ .budget = 400, .seed = 1, .blind = 1.0 });
+    defer blind.deinit(testing.allocator);
+    const blind_reached = deepSite().hit();
+
+    coverage.reset();
+    var steered = try explore(testing.allocator, deep, .{ .budget = 400, .seed = 1 });
+    defer steered.deinit(testing.allocator);
+    try testing.expect(!blind_reached);
+    try testing.expect(deepSite().hit());
+}
+
+test "an exploration repeats exactly" {
+    coverage.reset();
+    var a = try explore(testing.allocator, deep, .{ .budget = 300, .seed = 9 });
+    defer a.deinit(testing.allocator);
+    const passes_a = deepSite().passes;
+    coverage.reset();
+    var b = try explore(testing.allocator, deep, .{ .budget = 300, .seed = 9 });
+    defer b.deinit(testing.allocator);
+    try testing.expectEqual(passes_a, deepSite().passes);
+    try testing.expectEqual(a.corpus, b.corpus);
+    try testing.expectEqualSlices(u32, &a.by_move, &b.by_move);
+    try testing.expectEqualSlices(u32, &a.new_by_move, &b.new_by_move);
 }
