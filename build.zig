@@ -20,10 +20,26 @@ pub fn build(b: *std.Build) void {
     const coverage = b.addModule("coverage", .{ .root_source_file = b.path("src/coverage.zig") });
     // The seed explorer's tape and named choices (src/explore.zig): for
     // simulators and tools, never the kernel.
-    _ = b.addModule("explore", .{
+    const explore = b.addModule("explore", .{
         .root_source_file = b.path("src/explore.zig"),
         .imports = &.{.{ .name = "coverage", .module = coverage }},
     });
+
+    // **THE EXPLORER'S LAB** (src/explore_lab.zig): a synthetic story shaped
+    // like fat_sim, so a change to the explorer is measured in seconds.
+    const lab = b.addExecutable(.{
+        .name = "explore-lab",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/explore_lab.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "coverage", .module = coverage },
+                .{ .name = "explore", .module = explore },
+            },
+        }),
+    });
+    b.step("lab", "the explorer against blind runs on a synthetic story, in seconds").dependOn(&b.addRunArtifact(lab).step);
 
     const scan = b.addExecutable(.{
         .name = "coverage-scan",

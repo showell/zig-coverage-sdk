@@ -295,6 +295,18 @@ pub const Options = struct {
     /// before as new. False: a flip picks its choice and alternative at
     /// random.
     aim: bool = true,
+    /// **BLIND FIRST**: with `warmup` above 0, the share of blind runs starts
+    /// at all of them and falls to `blind` over the first `warmup` runs: a
+    /// corpus is only as good as the scenarios its first runs sampled.
+    warmup: u32 = 0,
+    /// **FLIPS BY NAME**: each named choice's name gets an equal share of the
+    /// flips, however many times a run made it, so the three choices that set
+    /// a run's scenario are not drowned by a hundred operation choices.
+    per_name: bool = false,
+    /// **EARLY BRANCHES**: this share of the re-rolls go back to a point drawn
+    /// toward the start of the run (its length times u³), so a branch can
+    /// re-roll the scenario too, not only what came after it.
+    early: f32 = 0.0,
 };
 
 /// How a run was made.
@@ -398,13 +410,17 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
     while (report.runs < options.budget) : (report.runs += 1) {
         const fresh = r.int(u64);
         var move: Move = .blind;
-        var tape = if (corpus.items.len == 0 or r.float(f32) < options.blind)
+        const p_blind: f32 = if (options.warmup > 0)
+            @max(options.blind, 1.0 - @as(f32, @floatFromInt(report.runs)) / @as(f32, @floatFromInt(options.warmup)))
+        else
+            options.blind;
+        var tape = if (corpus.items.len == 0 or r.float(f32) < p_blind)
             Tape.init(gpa, fresh)
         else blk: {
             const from = &corpus.items[pickEntry(r, corpus.items, reached_by)].tape;
             if (from.choices.items.len > 0 and r.float(f32) < options.flip) {
-                const aimed = if (options.aim) aimFlip(r, from.choices.items, &taken) else null;
-                const index = if (aimed) |a| a.index else r.uintLessThan(usize, from.choices.items.len);
+                const aimed = if (options.aim) aimFlip(r, from.choices.items, &taken, options.per_name) else null;
+                const index = if (aimed) |a| a.index else if (options.per_name) byName(r, from.choices.items) else r.uintLessThan(usize, from.choices.items.len);
                 const c = from.choices.items[index];
                 if (c.alternatives > 1) {
                     var alt = if (aimed) |a| a.alternative else r.uintLessThan(u32, c.alternatives - 1);
@@ -414,7 +430,11 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
                 }
             }
             move = .branch;
-            break :blk Tape.branch(gpa, from, r.uintAtMost(u32, from.position()), fresh, null);
+            const at: u32 = if (r.float(f32) < options.early) blk2: {
+                const u = r.float(f64);
+                break :blk2 @intFromFloat(@as(f64, @floatFromInt(from.position())) * u * u * u);
+            } else r.uintAtMost(u32, from.position());
+            break :blk Tape.branch(gpa, from, at, fresh, null);
         };
         var keep = false;
         defer if (!keep) tape.deinit();
@@ -477,17 +497,40 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
 /// **WHERE TO FLIP, AIMED**: among a run's named choices, the one whose
 /// least-taken other alternative has been taken least, weighted so a choice
 /// never flipped that way is likeliest; and that alternative.
-fn aimFlip(r: std.Random, choices: []const Choice, taken: *const std.StringHashMap([]u32)) ?Force {
+fn aimFlip(r: std.Random, choices: []const Choice, taken: *const std.StringHashMap([]u32), per_name: bool) ?Force {
     var total: f64 = 0;
-    for (choices) |c| total += aimWeight(c, taken).weight;
+    for (choices) |c| total += aimWeight(c, taken).weight * share(choices, c, per_name);
     if (total <= 0) return null;
     var at = r.float(f64) * total;
     for (choices, 0..) |c, i| {
         const w = aimWeight(c, taken);
-        at -= w.weight;
+        at -= w.weight * share(choices, c, per_name);
         if (at <= 0 and w.weight > 0) return .{ .index = @intCast(i), .alternative = w.alternative };
     }
     return null;
+}
+
+/// A choice's part of its name's share: one over how many times the run made
+/// a choice of that name (`Options.per_name`), or 1.
+fn share(choices: []const Choice, c: Choice, per_name: bool) f64 {
+    if (!per_name) return 1;
+    var n: f64 = 0;
+    for (choices) |o| {
+        if (o.name.ptr == c.name.ptr or std.mem.eql(u8, o.name, c.name)) n += 1;
+    }
+    return 1.0 / n;
+}
+
+/// A choice picked so each name has an equal chance (`Options.per_name`).
+fn byName(r: std.Random, choices: []const Choice) usize {
+    var total: f64 = 0;
+    for (choices) |c| total += share(choices, c, true);
+    var at = r.float(f64) * total;
+    for (choices, 0..) |c, i| {
+        at -= share(choices, c, true);
+        if (at <= 0) return i;
+    }
+    return choices.len - 1;
 }
 
 fn aimWeight(c: Choice, taken: *const std.StringHashMap([]u32)) struct { weight: f64, alternative: u32 } {
