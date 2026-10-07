@@ -57,6 +57,9 @@ pub const Tape = struct {
     /// tape's. Fresh bytes answer it, and this says it happened.
     drifted: bool = false,
     force: ?Force = null,
+    /// A forced choice whose draw could not be rewritten (it took more than
+    /// one fill), so replaying this tape does not take the flip.
+    unfaithful: bool = false,
 
     /// A tape that draws from `seed`: a run under it is the run `seed`'s
     /// PRNG gives, recorded.
@@ -95,6 +98,33 @@ pub const Tape = struct {
         return @intCast(t.ends.items.len);
     }
 
+    /// Rewrites fill `i`, one `uintLessThan(Draw, total)` drawn in one fill,
+    /// to bytes that draw `want`.
+    fn rewrite(t: *Tape, i: u32, comptime Draw: type, total: u32, want: u32) void {
+        const start = if (i == 0) 0 else t.ends.items[i - 1];
+        const slot = t.bytes.items[start..t.ends.items[i]];
+        if (slot.len != @sizeOf(Draw)) {
+            t.unfaithful = true;
+            return;
+        }
+        // The value `uintLessThan` maps to `want` is near `want`'s share of
+        // the range; try it and its neighbours, keeping one that is drawn in
+        // a single fill.
+        const span: u64 = @as(u64, std.math.maxInt(Draw)) + 1;
+        const guess: u64 = (@as(u64, want) * span + total - 1) / total;
+        var k: u64 = 0;
+        while (k < 4) : (k += 1) {
+            const x: Draw = @intCast(@min(guess + k, span - 1));
+            var one = Single{ .bytes = std.mem.asBytes(&x) };
+            const got = one.random().uintLessThan(Draw, @intCast(total));
+            if (got == want and one.used == 1) {
+                @memcpy(slot, std.mem.asBytes(&x));
+                return;
+            }
+        }
+        t.unfaithful = true;
+    }
+
     /// The bytes of fill `i`.
     pub fn fillAt(t: *const Tape, i: u32) []const u8 {
         const start = if (i == 0) 0 else t.ends.items[i - 1];
@@ -131,6 +161,19 @@ pub const Tape = struct {
     }
 };
 
+/// A source of one fill, for `Tape.rewrite` to test a candidate draw.
+const Single = struct {
+    bytes: []const u8,
+    used: u32 = 0,
+    fn random(o: *Single) std.Random {
+        return .init(o, fill);
+    }
+    fn fill(o: *Single, buf: []u8) void {
+        o.used += 1;
+        if (o.used == 1 and buf.len == o.bytes.len) @memcpy(buf, o.bytes) else @memset(buf, 0xFF);
+    }
+};
+
 /// **A NAMED CHOICE** among the fields of `weights`, an anonymous struct of
 /// comptime integer weights: `pick(r, "fat: the volume is FAT32", .{ .no = 3,
 /// .yes = 1 })` answers `.no` or `.yes`. The alternatives take the draw's
@@ -155,8 +198,20 @@ pub fn pick(r: std.Random, comptime name: []const u8, comptime weights: anytype)
     }
     if (tape) |t| {
         const index: u32 = @intCast(t.choices.items.len);
-        if (t.force) |force| if (force.index == index and force.alternative < fields.len) {
+        if (t.force) |force| if (force.index == index and force.alternative < fields.len and force.alternative != chosen) {
             chosen = force.alternative;
+            // **THE TAPE SAYS WHAT THE RUN DID**: the draw is rewritten to
+            // one that gives the forced alternative, so replaying this tape
+            // (a twin, a reproduction) takes the flip too.
+            comptime var starts: [fields.len]u32 = undefined;
+            comptime {
+                var sum: u32 = 0;
+                for (fields, 0..) |f, i| {
+                    starts[i] = sum;
+                    sum += @field(weights, f.name);
+                }
+            }
+            if (t.position() == at + 1) t.rewrite(at, Draw, total, starts[chosen]) else t.unfaithful = true;
         };
         t.choices.append(t.gpa, .{ .name = name, .position = at, .chosen = chosen, .alternatives = fields.len }) catch {};
     }
@@ -444,6 +499,31 @@ test "a forced choice takes the other way, and the draws after it keep their pla
     try testing.expectEqual(c.position, flipped.choices.items[0].position);
     try testing.expectEqual(@as(usize, 2 + 1 + 20 + 1), b.items.len);
     try testing.expect(!flipped.drifted);
+}
+
+test "a flipped tape, replayed, takes the flip" {
+    for (0..200) |seed| {
+        var first = Tape.init(testing.allocator, seed);
+        defer first.deinit();
+        var a: std.ArrayList(u64) = .empty;
+        defer a.deinit(testing.allocator);
+        try story(first.random(), &a);
+        const c = first.choices.items[0];
+        var flipped = Tape.branch(testing.allocator, &first, c.position, seed + 500, .{ .index = 0, .alternative = 1 - c.chosen });
+        defer flipped.deinit();
+        var b: std.ArrayList(u64) = .empty;
+        defer b.deinit(testing.allocator);
+        try story(flipped.random(), &b);
+        try testing.expect(!flipped.unfaithful);
+
+        var again = Tape.branch(testing.allocator, &flipped, flipped.position(), seed + 900, null);
+        defer again.deinit();
+        var d: std.ArrayList(u64) = .empty;
+        defer d.deinit(testing.allocator);
+        try story(again.random(), &d);
+        try testing.expectEqualSlices(u64, b.items, d.items);
+        try testing.expectEqual(1 - c.chosen, again.choices.items[0].chosen);
+    }
 }
 
 test "pick without a tape is a plain weighted choice" {
