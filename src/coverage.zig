@@ -134,8 +134,13 @@ pub const Site = extern struct {
     /// edge: a table of 256 slots full is the same edge as one of 2 full
     /// (`left - right` is 0 for both), and only this tells them apart.
     reach: Operands = .{},
+    /// **WHAT THE STREAM HAS BEEN TOLD** (`compare`): guidance lines
+    /// printed, and the coarse place of the last edge and reach printed.
+    printed: u8 = 0,
+    printed_edge: u8 = 0xFF,
+    printed_reach: u8 = 0,
     /// To `site_size`, which the catalog steps by.
-    reserved: [16]u8 = @splat(0),
+    reserved: [13]u8 = @splat(0),
 
     pub fn hit(s: *const Site) bool {
         return s.passes + s.fails > 0;
@@ -333,8 +338,59 @@ fn compare(comptime src: std.builtin.SourceLocation, comptime kind: Kind, left: 
     if (nearer) s.edge = ops;
     if (further) s.reach = ops;
     const out = sink orelse return;
+    if (!worthPrinting(s, ops, nearer, further, kind.maximize())) return;
     declare();
     emitGuidance(out, s, ops);
+}
+
+/// Guidance lines a comparison prints before only the coarse ones.
+const free_lines = 16;
+
+/// **THE STREAM THINS, THE RECORD DOES NOT.** A comparison over a count that
+/// only grows (a log's next byte, the bytes a cache holds) sets a new reach
+/// at every call, and a line at each one flooded a kernel's console: about
+/// 450 lines of 300 bytes in one boot, at an exit a byte under metal-vmm,
+/// long enough to change what the run did (gopher-metal v19's lossy sweep,
+/// 2026-10-07). So the first `free_lines` new edges and reaches print, and
+/// after them only an edge whose distance from the limit halved, or a reach
+/// that crossed a power of two. `edge` and `reach` keep every call exact for
+/// `report`; a reader of the stream sees each within a factor of two.
+fn worthPrinting(s: *Site, ops: Operands, nearer: bool, further: bool, maximize: bool) bool {
+    const eb = gapBucket(ops);
+    const rk = reachKey(ops);
+    const worth = s.printed < free_lines or
+        (nearer and eb < s.printed_edge) or
+        (further and (if (maximize) rk > s.printed_reach else rk < s.printed_reach));
+    if (!worth) return false;
+    s.printed +|= 1;
+    s.printed_edge = @min(s.printed_edge, eb);
+    s.printed_reach = if (s.printed == 1) rk else if (maximize) @max(s.printed_reach, rk) else @min(s.printed_reach, rk);
+    return true;
+}
+
+/// How many bits the distance from the limit takes: halving it drops one.
+fn gapBucket(o: Operands) u8 {
+    const g = o.gap();
+    const mag: u128 = switch (g) {
+        .int => |x| @abs(x),
+        .float => |x| if (x != x) 0 else @intFromFloat(@min(@abs(x), 1.0e30)),
+    };
+    return @intCast(128 - @clz(mag));
+}
+
+/// `left`, coarsely and in order: a power of two crossed, either sign.
+fn reachKey(o: Operands) u8 {
+    const v: i128 = switch (o.what) {
+        .signed => @as(i64, @bitCast(o.left)),
+        .unsigned => o.left,
+        .float => blk: {
+            const f: f64 = @bitCast(o.left);
+            break :blk if (f != f) 0 else @intFromFloat(std.math.clamp(f, -1.0e30, 1.0e30));
+        },
+        .none => 0,
+    };
+    const bits: i32 = @intCast(128 - @clz(@abs(v)));
+    return @intCast(if (v >= 0) 128 + bits else 127 - bits);
 }
 
 /// **A SITE THE SOURCE HAS, WHETHER OR NOT ITS CODE IS COMPILED.** Called by
@@ -684,6 +740,9 @@ pub fn reset() void {
         s.fails = 0;
         s.edge = .{};
         s.reach = .{};
+        s.printed = 0;
+        s.printed_edge = 0xFF;
+        s.printed_reach = 0;
     }
     declared = false;
 }
@@ -791,6 +850,26 @@ test "the floor: a property on it that was never reached is under it, and so is 
 fn generic(wire: anytype) void {
     _ = wire;
     sometimes(@src(), true, "inside a generic, called with two types", null);
+}
+
+var counted_lines: usize = 0;
+fn countLines(line: []const u8) void {
+    if (std.mem.indexOf(u8, line, "a ring's next byte is inside it") != null) counted_lines += 1;
+}
+
+test "a count that only grows prints a few guidance lines, and the record stays exact" {
+    reset();
+    counted_lines = 0;
+    sink = countLines;
+    defer sink = null;
+    var i: u32 = 0;
+    while (i < 65536) : (i += 1) alwaysLessThan(@src(), i, @as(u32, 65536), "a ring's next byte is inside it", null);
+    // The free lines, then a halving of the gap or a power of two crossed:
+    // about fifty, where every new reach printed would be 65,536.
+    try testing.expect(counted_lines >= free_lines);
+    try testing.expect(counted_lines <= free_lines + 2 * 18);
+    const s = mine("a ring's next byte is inside it");
+    try testing.expectEqual(@as(u64, 65535), s.reach.left);
 }
 
 test "a generic called with two types is one site" {
