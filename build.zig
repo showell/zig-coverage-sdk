@@ -18,6 +18,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const coverage = b.addModule("coverage", .{ .root_source_file = b.path("src/coverage.zig") });
+    // The seed explorer's tape and named choices (src/explore.zig): for
+    // simulators and tools, never the kernel.
+    _ = b.addModule("explore", .{ .root_source_file = b.path("src/explore.zig") });
 
     const scan = b.addExecutable(.{
         .name = "coverage-scan",
@@ -49,6 +52,12 @@ pub fn build(b: *std.Build) void {
             },
         }) });
         test_step.dependOn(&b.addRunArtifact(scanned).step);
+        const explore_unit = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/explore.zig"),
+            .target = target,
+            .optimize = mode,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(explore_unit).step);
     }
 }
 
