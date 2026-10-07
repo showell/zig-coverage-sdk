@@ -307,10 +307,27 @@ pub const Options = struct {
     /// toward the start of the run (its length times u³), so a branch can
     /// re-roll the scenario too, not only what came after it.
     early: f32 = 0.0,
+    /// **MOMENTS** (Antithesis's own move): this share of the runs that are
+    /// not blind go back to a **moment** of a corpus run, a point where it
+    /// did something no run before it had (`coverage.on_moment`), and either
+    /// re-roll from just after it or flip one of the next few named choices.
+    /// A run that opened one door is most likely to open the next one from
+    /// there.
+    moment: f32 = 0.0,
+    /// **THE FAST SCHEDULE** (AFL++'s): a corpus run is picked less often
+    /// the more it has been picked (one over the square root), and half as
+    /// often for each pick in a row that found nothing.
+    fast: bool = false,
+    /// **A LEARNING ALLOCATOR**: Thompson sampling picks each run's move
+    /// (blind, branch, flip, moment) from how often each move has found
+    /// something never seen before, recently (a discounted count), in place
+    /// of the fixed shares above. `warmup` still applies.
+    bandit: bool = false,
 };
 
 /// How a run was made.
-pub const Move = enum { blind, branch, flip };
+pub const Move = enum { blind, branch, flip, moment };
+const moves = std.enums.values(Move).len;
 
 /// What an exploration found, for its report.
 pub const Report = struct {
@@ -327,9 +344,12 @@ pub const Report = struct {
     /// the run took the flip, but replaying its tape does not, so a failure
     /// it found will not reproduce from the tape alone.
     unfaithful: u32 = 0,
-    by_move: [3]u32 = @splat(0),
+    by_move: [moves]u32 = @splat(0),
     /// Runs that found something new to the explorer, by move.
-    new_by_move: [3]u32 = @splat(0),
+    new_by_move: [moves]u32 = @splat(0),
+    /// Runs that found something never seen before (a site reached, a
+    /// failure, an alternative taken: not only an edge moved), by move.
+    novel_by_move: [moves]u32 = @splat(0),
     /// The tapes of runs whose oracle failed, in the order found. The
     /// caller owns them (`deinit`).
     failures: std.ArrayList(Tape) = .empty,
@@ -352,7 +372,36 @@ const Entry = struct {
     tape: Tape,
     /// Catalog indices of the sites this run reached.
     hits: []u32,
+    /// This run's own moments, in order.
+    moments: []Moment,
+    /// How many runs were made from it, and how many of the last ones in a
+    /// row found nothing (`Options.fast`).
+    picks: u32 = 0,
+    barren: u32 = 0,
+
+    fn deinit(e: *Entry, gpa: Allocator) void {
+        e.tape.deinit();
+        gpa.free(e.hits);
+        gpa.free(e.moments);
+    }
 };
+
+/// A point in a run where a site did something new (`coverage.on_moment`):
+/// the tape position, and the site's catalog index.
+const Moment = struct { at: u32, site: u32 };
+
+/// Where `coverage.on_moment` writes, while a run of `explore` is under way.
+var moment_tape: ?*const Tape = null;
+var moment_list: std.ArrayList(struct { at: u32, site: *coverage.Site }) = .empty;
+var moment_gpa: Allocator = undefined;
+
+fn noteMoment(site: *coverage.Site) void {
+    const t = moment_tape orelse return;
+    moment_list.append(moment_gpa, .{ .at = t.position(), .site = site }) catch {};
+}
+
+/// A run's moments kept for the corpus, at most this many (the latest).
+const max_moments = 64;
 
 /// **THE LOOP.** Runs `run` `options.budget` times. A blind run draws from a
 /// fresh seed. Otherwise it starts from a run in the corpus, chosen by the
@@ -390,10 +439,7 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
 
     var corpus: std.ArrayList(Entry) = .empty;
     defer {
-        for (corpus.items) |*e| {
-            e.tape.deinit();
-            gpa.free(e.hits);
-        }
+        for (corpus.items) |*e| e.deinit(gpa);
         corpus.deinit(gpa);
     }
     var hits: std.ArrayList(u32) = .empty;
@@ -406,36 +452,46 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
         while (vit.next()) |v| gpa.free(v.*);
         taken.deinit();
     }
+    // The moments of the run under way (`coverage.on_moment`).
+    var index_of: std.AutoHashMap(*coverage.Site, u32) = .init(gpa);
+    defer index_of.deinit();
+    for (sites.items, 0..) |site, i| try index_of.put(site, @intCast(i));
+    moment_list = .empty;
+    moment_gpa = gpa;
+    const was_hook = coverage.on_moment;
+    if (options.moment > 0 or options.bandit) coverage.on_moment = noteMoment;
+    defer {
+        coverage.on_moment = was_hook;
+        moment_tape = null;
+        moment_list.deinit(gpa);
+    }
+    // The learning allocator's discounted wins and losses, by move.
+    var wins: [moves]f64 = @splat(0);
+    var losses: [moves]f64 = @splat(0);
 
     while (report.runs < options.budget) : (report.runs += 1) {
         const fresh = r.int(u64);
-        var move: Move = .blind;
-        const p_blind: f32 = if (options.warmup > 0)
-            @max(options.blind, 1.0 - @as(f32, @floatFromInt(report.runs)) / @as(f32, @floatFromInt(options.warmup)))
+        // Blind first (`warmup`): the share of blind runs falls from all of
+        // them to `blind`; the learning allocator takes over from there.
+        const warming: f32 = if (options.warmup > 0)
+            @max(0.0, 1.0 - @as(f32, @floatFromInt(report.runs)) / @as(f32, @floatFromInt(options.warmup)))
         else
-            options.blind;
-        var tape = if (corpus.items.len == 0 or r.float(f32) < p_blind)
-            Tape.init(gpa, fresh)
-        else blk: {
-            const from = &corpus.items[pickEntry(r, corpus.items, reached_by)].tape;
-            if (from.choices.items.len > 0 and r.float(f32) < options.flip) {
-                const aimed = if (options.aim) aimFlip(r, from.choices.items, &taken, options.per_name) else null;
-                const index = if (aimed) |a| a.index else if (options.per_name) byName(r, from.choices.items) else r.uintLessThan(usize, from.choices.items.len);
-                const c = from.choices.items[index];
-                if (c.alternatives > 1) {
-                    var alt = if (aimed) |a| a.alternative else r.uintLessThan(u32, c.alternatives - 1);
-                    if (aimed == null and alt >= c.chosen) alt += 1;
-                    move = .flip;
-                    break :blk Tape.branch(gpa, from, c.position, fresh, .{ .index = @intCast(index), .alternative = alt });
-                }
-            }
-            move = .branch;
-            const at: u32 = if (r.float(f32) < options.early) blk2: {
-                const u = r.float(f64);
-                break :blk2 @intFromFloat(@as(f64, @floatFromInt(from.position())) * u * u * u);
-            } else r.uintAtMost(u32, from.position());
-            break :blk Tape.branch(gpa, from, at, fresh, null);
-        };
+            0.0;
+        const want: Move = if (corpus.items.len == 0)
+            .blind
+        else if (options.bandit)
+            (if (r.float(f32) < warming) .blind else thompson(r, wins, losses))
+        else if (r.float(f32) < @max(options.blind, warming))
+            .blind
+        else if (r.float(f32) < options.moment)
+            .moment
+        else if (r.float(f32) < options.flip)
+            .flip
+        else
+            .branch;
+        const made = try makeRun(gpa, r, want, fresh, corpus.items, reached_by, &taken, options);
+        var tape = made.tape;
+        const move = made.move;
         var keep = false;
         defer if (!keep) tape.deinit();
         // A tape kept points at no other: the corpus moves and is freed.
@@ -447,10 +503,14 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
         report.by_move[@intFromEnum(move)] += 1;
 
         for (sites.items, before) |site, *b| b.* = .{ .passes = site.passes, .fails = site.fails, .reach = site.reach, .edge = site.edge };
+        moment_list.clearRetainingCapacity();
+        moment_tape = &tape;
         const failed = if (run(&tape)) false else |_| true;
+        moment_tape = null;
 
         hits.clearRetainingCapacity();
         var new = false;
+        var novel = false;
         for (sites.items, before, 0..) |site, b, i| {
             if (site.passes == b.passes and site.fails == b.fails) continue;
             try hits.append(gpa, @intCast(i));
@@ -458,8 +518,12 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
                 ever[i] = true;
                 report.first[i] = .{ .run = report.runs, .move = move };
                 new = true;
+                novel = true;
             }
-            if (site.fails > 0 and b.fails == 0) new = true;
+            if (site.fails > 0 and b.fails == 0) {
+                new = true;
+                novel = true;
+            }
             if (!std.meta.eql(site.reach, b.reach) or !std.meta.eql(site.edge, b.edge)) new = true;
         }
         if (tape.drifted) report.drifted += 1;
@@ -474,10 +538,21 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
             if (c.chosen >= counts.len) continue;
             if (counts[c.chosen] == 0) {
                 new = true;
+                novel = true;
                 report.decisions += 1;
             }
             counts[c.chosen] += 1;
         }
+        if (made.from) |f| {
+            corpus.items[f].picks += 1;
+            corpus.items[f].barren = if (new) 0 else corpus.items[f].barren + 1;
+        }
+        for (&wins, &losses) |*w, *l| {
+            w.* *= bandit_decay;
+            l.* *= bandit_decay;
+        }
+        if (novel) wins[@intFromEnum(move)] += 1 else losses[@intFromEnum(move)] += 1;
+        if (novel) report.novel_by_move[@intFromEnum(move)] += 1;
         if (failed) {
             keep = true;
             try report.failures.append(gpa, tape);
@@ -486,13 +561,115 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
         if (new) {
             report.new_by_move[@intFromEnum(move)] += 1;
             for (hits.items) |i| reached_by[i] += 1;
-            try corpus.append(gpa, .{ .tape = tape, .hits = try gpa.dupe(u32, hits.items) });
+            // Its own moments only: a moment lives in the one run that made
+            // it, so a property's rarity is its moment's weight, not diluted
+            // over every run that replayed past it.
+            var ms: std.ArrayList(Moment) = .empty;
+            errdefer ms.deinit(gpa);
+            for (moment_list.items) |m| try ms.append(gpa, .{ .at = m.at, .site = index_of.get(m.site) orelse continue });
+            const drop = ms.items.len -| max_moments;
+            if (drop > 0) ms.replaceRangeAssumeCapacity(0, drop, &.{});
+            const moments_owned = try ms.toOwnedSlice(gpa);
+            errdefer gpa.free(moments_owned);
+            try corpus.append(gpa, .{ .tape = tape, .hits = try gpa.dupe(u32, hits.items), .moments = moments_owned });
             keep = true;
         }
     }
     report.corpus = @intCast(corpus.items.len);
     return report;
 }
+
+/// How much of the learning allocator's past each run forgets: wins and
+/// losses older than a few hundred runs count for little, since what a move
+/// can find changes as the corpus grows.
+const bandit_decay = 0.99;
+
+/// **THOMPSON SAMPLING**: a draw from each move's Beta(1 + wins, 1 + losses),
+/// and the move whose draw is highest.
+fn thompson(r: std.Random, wins: [moves]f64, losses: [moves]f64) Move {
+    var best: f64 = -1;
+    var pick_move: Move = .blind;
+    for (0..moves) |i| {
+        const x = gamma(r, 1 + wins[i]);
+        const y = gamma(r, 1 + losses[i]);
+        const b = x / (x + y);
+        if (b > best) {
+            best = b;
+            pick_move = @enumFromInt(i);
+        }
+    }
+    return pick_move;
+}
+
+/// A Gamma(a, 1) draw for a ≥ 1 (Marsaglia and Tsang).
+fn gamma(r: std.Random, a: f64) f64 {
+    const d = a - 1.0 / 3.0;
+    const c = 1.0 / @sqrt(9.0 * d);
+    while (true) {
+        const x = r.floatNorm(f64);
+        const v0 = 1.0 + c * x;
+        if (v0 <= 0) continue;
+        const v = v0 * v0 * v0;
+        const u = r.float(f64);
+        if (u > 0 and @log(u) < 0.5 * x * x + d - d * v + d * @log(v)) return d * v;
+    }
+}
+
+const Made = struct { tape: Tape, move: Move, from: ?usize = null };
+
+/// **ONE RUN'S TAPE, FOR THE MOVE WANTED**, or the nearest move that can be
+/// made: a flip needs a run with a named choice, a moment a run with a
+/// moment, and every move but blind a corpus.
+fn makeRun(gpa: Allocator, r: std.Random, want: Move, fresh: u64, corpus: []Entry, reached_by: []const u32, taken: *const std.StringHashMap([]u32), options: Options) !Made {
+    if (want == .blind or corpus.len == 0) return .{ .tape = Tape.init(gpa, fresh), .move = .blind };
+    if (want == .moment) if (pickMoment(r, corpus, reached_by, options.fast)) |pm| {
+        const i = pm.entry;
+        const from = &corpus[i].tape;
+        const m = pm.at;
+        // The named choices after the moment. Half the time one of them is
+        // flipped; otherwise the run re-rolls from one of them, the nearest
+        // likeliest, so the moment's own past is kept and what comes right
+        // after it is drawn again. With no named choice after it, from a
+        // point drawn toward the moment.
+        var j: usize = 0;
+        while (j < from.choices.items.len and from.choices.items[j].position < m) j += 1;
+        const window = from.choices.items[j..@min(j + moment_window, from.choices.items.len)];
+        if (window.len > 0) {
+            var k: usize = 0;
+            while (k + 1 < window.len and r.boolean()) k += 1;
+            const c = window[k];
+            if (r.boolean() and c.alternatives > 1) {
+                var alt = r.uintLessThan(u32, c.alternatives - 1);
+                if (alt >= c.chosen) alt += 1;
+                return .{ .tape = Tape.branch(gpa, from, c.position, fresh, .{ .index = @intCast(j + k), .alternative = alt }), .move = .moment, .from = i };
+            }
+            return .{ .tape = Tape.branch(gpa, from, c.position, fresh, null), .move = .moment, .from = i };
+        }
+        const u = r.float(f64);
+        const span: f64 = @floatFromInt(from.position() -| m);
+        return .{ .tape = Tape.branch(gpa, from, m + @as(u32, @intFromFloat(span * u * u * u)), fresh, null), .move = .moment, .from = i };
+    };
+    const i = pickEntry(r, corpus, reached_by, options.fast, false).?;
+    const from = &corpus[i].tape;
+    if (want == .flip and from.choices.items.len > 0) {
+        const aimed = if (options.aim) aimFlip(r, from.choices.items, taken, options.per_name) else null;
+        const index = if (aimed) |a| a.index else if (options.per_name) byName(r, from.choices.items) else r.uintLessThan(usize, from.choices.items.len);
+        const c = from.choices.items[index];
+        if (c.alternatives > 1) {
+            var alt = if (aimed) |a| a.alternative else r.uintLessThan(u32, c.alternatives - 1);
+            if (aimed == null and alt >= c.chosen) alt += 1;
+            return .{ .tape = Tape.branch(gpa, from, c.position, fresh, .{ .index = @intCast(index), .alternative = alt }), .move = .flip, .from = i };
+        }
+    }
+    const at: u32 = if (r.float(f32) < options.early) blk: {
+        const u = r.float(f64);
+        break :blk @intFromFloat(@as(f64, @floatFromInt(from.position())) * u * u * u);
+    } else r.uintAtMost(u32, from.position());
+    return .{ .tape = Tape.branch(gpa, from, at, fresh, null), .move = .branch, .from = i };
+}
+
+/// How many named choices after a moment a moment's move chooses among.
+const moment_window = 8;
 
 /// **WHERE TO FLIP, AIMED**: among a run's named choices, the one whose
 /// least-taken other alternative has been taken least, weighted so a choice
@@ -554,20 +731,60 @@ fn aimWeight(c: Choice, taken: *const std.StringHashMap([]u32)) struct { weight:
 
 /// A corpus run, weighted by what it reached that few others did: each site
 /// it reached counts one over the number of corpus runs that reached it.
-fn pickEntry(r: std.Random, corpus: []const Entry, reached_by: []const u32) usize {
+/// `fast`: scaled down by how often it was picked (`Options.fast`).
+/// `with_moments`: only runs that have a moment; null if none has.
+fn pickEntry(r: std.Random, corpus: []const Entry, reached_by: []const u32, fast: bool, with_moments: bool) ?usize {
     var total: f64 = 0;
-    for (corpus) |e| total += weight(e, reached_by);
+    for (corpus) |e| total += weight(e, reached_by, fast, with_moments);
+    if (total <= 0) return null;
     var at = r.float(f64) * total;
+    var last: ?usize = null;
     for (corpus, 0..) |e, i| {
-        at -= weight(e, reached_by);
+        const w = weight(e, reached_by, fast, with_moments);
+        if (w <= 0) continue;
+        last = i;
+        at -= w;
         if (at <= 0) return i;
     }
-    return corpus.len - 1;
+    return last;
 }
 
-fn weight(e: Entry, reached_by: []const u32) f64 {
+/// **A MOMENT TO RETURN TO**: over every corpus run's moments, each weighted
+/// by the rarity of the site that made it (one over the corpus runs that
+/// reached the site) and by its run's `fast` scale; null if there is none.
+const Picked = struct { entry: usize, at: u32 };
+
+fn pickMoment(r: std.Random, corpus: []const Entry, reached_by: []const u32, fast: bool) ?Picked {
+    var total: f64 = 0;
+    for (corpus) |e| for (e.moments) |m| {
+        total += momentWeight(e, m, reached_by, fast);
+    };
+    if (total <= 0) return null;
+    var at = r.float(f64) * total;
+    var last: ?Picked = null;
+    for (corpus, 0..) |e, i| for (e.moments) |m| {
+        last = .{ .entry = i, .at = m.at };
+        at -= momentWeight(e, m, reached_by, fast);
+        if (at <= 0) return last;
+    };
+    return last;
+}
+
+fn momentWeight(e: Entry, m: Moment, reached_by: []const u32, fast: bool) f64 {
+    var w = 1.0 / @as(f64, @floatFromInt(@max(reached_by[m.site], 1)));
+    if (fast) w *= fastScale(e);
+    return w;
+}
+
+fn fastScale(e: Entry) f64 {
+    return std.math.pow(f64, 0.5, @floatFromInt(@min(e.barren, 16))) / @sqrt(1.0 + @as(f64, @floatFromInt(e.picks)));
+}
+
+fn weight(e: Entry, reached_by: []const u32, fast: bool, with_moments: bool) f64 {
+    if (with_moments and e.moments.len == 0) return 0;
     var w: f64 = 0.01;
     for (e.hits) |i| w += 1.0 / @as(f64, @floatFromInt(@max(reached_by[i], 1)));
+    if (fast) w *= fastScale(e);
     return w;
 }
 
@@ -880,6 +1097,68 @@ test "aiming beats random flips on a tight budget, over fifty explorations" {
         }
     }
     try testing.expect(aimed >= random + 8);
+}
+
+/// A chain of five links, each made only by the right operation right after
+/// the last link was made: a run that made one is the place to look for the
+/// next, which blind runs rarely put together.
+fn chain(tape: *Tape) anyerror!void {
+    const r = tape.random();
+    const keys = [_]u8{ 2, 5, 1, 6, 3 };
+    var made: usize = 0;
+    for (0..40) |_| {
+        const op: u8 = @intFromEnum(pick(r, "chain: the operation", .{ .o0 = 1, .o1 = 1, .o2 = 1, .o3 = 1, .o4 = 1, .o5 = 1, .o6 = 1, .o7 = 1 }));
+        made = if (made < keys.len and op == keys[made]) made + 1 else 0;
+        if (made >= 1) coverage.reachable(@src(), "chain: one link", null);
+        if (made >= 2) coverage.reachable(@src(), "chain: two links", null);
+        if (made >= 3) coverage.reachable(@src(), "chain: three links", null);
+        if (made >= 4) coverage.reachable(@src(), "chain: four links", null);
+        if (made >= 5) coverage.reachable(@src(), "chain: five links", null);
+    }
+}
+
+fn chainEnd() *coverage.Site {
+    var it = coverage.catalog();
+    while (it.next()) |site| {
+        if (std.mem.eql(u8, std.mem.span(site.message), "chain: five links")) return site;
+    }
+    unreachable;
+}
+
+test "returning to moments puts a chain together that blind runs and plain branches do not" {
+    var counts = [_]u32{ 0, 0, 0 };
+    for (0..10) |seed| {
+        const columns = [_]Options{
+            .{ .budget = 400, .seed = seed, .blind = 1.0 },
+            .{ .budget = 400, .seed = seed },
+            .{ .budget = 400, .seed = seed, .moment = 0.5 },
+        };
+        for (columns, &counts) |o, *n| {
+            coverage.reset();
+            var report = try explore(testing.allocator, chain, o);
+            report.deinit(testing.allocator);
+            if (chainEnd().hit()) n.* += 1;
+        }
+    }
+    // Measured: blind 3 of 10, the explorer without moments 4, with them 9.
+    try testing.expect(counts[2] >= counts[0] + 4);
+    try testing.expect(counts[2] >= counts[1] + 4);
+}
+
+test "the hook is put back, and an exploration with moments and the bandit repeats exactly" {
+    const before = coverage.on_moment;
+    var reports: [2]Report = undefined;
+    var ends: [2]u32 = undefined;
+    for (&reports, &ends) |*rep, *e| {
+        coverage.reset();
+        rep.* = try explore(testing.allocator, chain, .{ .budget = 200, .seed = 7, .moment = 0.3, .bandit = true, .warmup = 8 });
+        e.* = chainEnd().passes;
+    }
+    defer for (&reports) |*rep| rep.deinit(testing.allocator);
+    try testing.expectEqual(before, coverage.on_moment);
+    try testing.expectEqual(ends[0], ends[1]);
+    try testing.expectEqualSlices(u32, &reports[0].by_move, &reports[1].by_move);
+    try testing.expect(reports[0].by_move[@intFromEnum(Move.moment)] > 0);
 }
 
 /// A "simulator" that is not a function of its tape: every other call draws

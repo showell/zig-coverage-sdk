@@ -255,6 +255,13 @@ fn Operand(comptime T: type) type {
 /// the only way to read the run.
 pub var sink: ?*const fn (line: []const u8) void = null;
 
+/// **A MOMENT**: called when a site does something no call before it did
+/// since the last `reset`: its first pass, its first failure, or a
+/// comparison whose edge or reach moved. An explorer records where in a run
+/// each moment came, to return there (src/explore.zig, `Options.moment`).
+/// Null: nothing is called.
+pub var on_moment: ?*const fn (s: *Site) void = null;
+
 pub fn always(comptime src: std.builtin.SourceLocation, cond: bool, comptime message: [:0]const u8, details: anytype) void {
     record(site(src, .always, message), cond, details);
 }
@@ -339,6 +346,7 @@ fn compare(comptime src: std.builtin.SourceLocation, comptime kind: Kind, left: 
     if (!nearer and !further) return;
     if (nearer) s.edge = ops;
     if (further) s.reach = ops;
+    if (on_moment) |f| f(s);
     const out = sink orelse return;
     if (!worthPrinting(s, ops, nearer, further, kind.maximize())) return;
     declare();
@@ -540,6 +548,7 @@ fn recordWith(s: *Site, cond: bool, details: anytype, ops: ?Operands) void {
     const first = if (cond) s.passes == 0 else s.fails == 0;
     if (cond) s.passes +|= 1 else s.fails +|= 1;
     if (!first) return;
+    if (on_moment) |f| f(s);
     const out = sink orelse return;
     declare();
     emitWith(out, s, true, cond, details, ops);

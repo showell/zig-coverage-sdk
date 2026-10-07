@@ -221,6 +221,28 @@ property, how many runs reached it and which first, for each comparison the
 nearest any run came to its edge and which run, and the properties only one
 run ever reached. `python3 tools/report_test.py` is its own test.
 
+## The seed explorer (`src/explore.zig`)
+
+For simulators, never the kernel. A simulator draws its whole run from a
+`std.Random`; under a `Tape` every draw is recorded, so a run can be replayed
+to any point and re-rolled from there, and `pick`/`flag` name the choices a
+run makes so the explorer can flip one. `explore(gpa, run, options)` grows a
+corpus of runs that did something new and makes each next run by one of four
+moves: **blind** (a fresh seed), **branch** (re-roll from a random point),
+**flip** (force another alternative of a named choice) and **moment**
+(return to the point where a corpus run first did something new, and re-roll
+or flip just after it). `coverage.on_moment` is the hook the last one uses.
+
+    zig build lab       # every strategy against blind runs on two synthetic stories, about a minute
+
+Measured in the lab (60 explorer seeds, 300 runs, 2026-10-07): moments about
+double how often the deepest property is reached (a rare run of four in a row:
+12 explorations to 26; a chain of four rare steps: 15 to 30) and cost a little
+breadth at ten runs; the Thompson-sampling allocator (`bandit`) does as well
+at depth and stays near blind at ten runs. `fast`, `per_name` and `early`
+measured no better than without. All are off by default until gopher-metal's
+own simulators confirm them.
+
 ## What is missing, compared with their SDKs
 
 - randomness (`get_random`, `random_choice`) and lifecycle (`setup_complete`,
