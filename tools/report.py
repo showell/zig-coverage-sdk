@@ -33,6 +33,16 @@ nearest any run came (the most or the least `left - right`, as the line's
 maximizes, the least of one that minimizes). The reach is what tells a full
 table of 256 from a full table of 2, which are the same edge.
 
+**THE STREAM THINS, SO EDGE AND REACH ARE BOUNDS.** The SDK prints a
+comparison's first 16 new edges and reaches, and after that only an edge
+whose distance from the limit halved or a reach that crossed a power of
+two. The kernel's own record stays exact, but this report reads the stream,
+so the run came at least as near as its edge says ("or nearer") and went at
+least as far as its reach says ("or further"), by up to a factor of two.
+An edge floor is judged on the stream's reach, so a number between a
+power of two and the next one can read short when the run got there: put
+powers of two on an edge floor.
+
 **AN EDGE FLOOR** (`--edges <file>`) is how far each comparison must reach:
 one line each, the message, then `>=` or `<=` and a number, `#` for comments:
 
@@ -215,7 +225,7 @@ def against(here, there):
             if ha[i]["left"] != hb[i]["left"]:
                 moved.append(f"       {kind}: left {hb[i]['left']} -> {ha[i]['left']}  {i}")
     if moved:
-        out.append("  edges and reaches that moved (there -> here):")
+        out.append("  edges and reaches that moved, as the streams say (there -> here):")
         out += moved
     declared_only = sorted(set(a) ^ set(b))
     if declared_only:
@@ -261,10 +271,10 @@ def main(paths, floor=None, edges=None, there_paths=None):
         if p["first_run"] is not None:
             reached += f", first {names[p['first_run']]}"
         edge = runs.edges.get(id_)
-        at_edge = f"; its edge: left {edge['left']}, right {edge['right']}, in {names[edge['run']]}" if edge else ""
+        at_edge = f"; its edge: left {edge['left']}, right {edge['right']} or nearer, in {names[edge['run']]}" if edge else ""
         far = runs.reaches.get(id_)
         if far and edge and far["left"] != edge["left"]:
-            at_edge += f"; its reach: left {far['left']}, right {far['right']}, in {names[far['run']]}"
+            at_edge += f"; its reach: left {far['left']} or further, right {far['right']}, in {names[far['run']]}"
         print(f"{verdict:<5} {p['display']:<19} {id_}  ({where['file']}:{where['begin_line']}; "
               f"{reached}; {p['true']} true, {p['false']} false{at_edge})")
         if p["first_false"] is not None and not ok:
@@ -295,7 +305,7 @@ def main(paths, floor=None, edges=None, there_paths=None):
         reached = far["left"] if far else None
         if reached is None or (reached < number if sign == ">=" else reached > number):
             print(f"EDGE  {'short':<19} {message}  (wanted left {sign} {number}; "
-                  f"{'never reached' if reached is None else f'its reach: left {reached}'})")
+                  f"{'never reached' if reached is None else f'its reach: left {reached} or further, as the stream says'})")
             short += 1
     if short:
         print(f"short of the edge floor: {short}")

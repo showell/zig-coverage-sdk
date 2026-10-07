@@ -132,11 +132,11 @@ class Report(unittest.TestCase):
             + [run(2)] + boot(assertion("slots", "Always", True, True, {"left": 9, "right": 256}),
                               guidance("slots", True, 9, 256), guidance("slots", True, 250, 256))
             + [run(3)] + boot(guidance("slots", True, 100, 256)))
-        self.assertIn("its edge: left 250, right 256, in FAULT_SEED=2", self.line(text, "slots"))
+        self.assertIn("its edge: left 250, right 256 or nearer, in FAULT_SEED=2", self.line(text, "slots"))
         # Minimized: the least left - right wins.
         _, text = self.judge(boot(assertion("slots", "Always", True, True),
                                   guidance("slots", False, 30, 10), guidance("slots", False, 12, 10)))
-        self.assertIn("its edge: left 12, right 10", self.line(text, "slots"))
+        self.assertIn("its edge: left 12, right 10 or nearer", self.line(text, "slots"))
 
     def test_a_reach_tells_a_full_table_of_203_from_one_of_2(self):
         _, text = self.judge(
@@ -144,7 +144,7 @@ class Report(unittest.TestCase):
                             guidance("slots", True, 2, 2), guidance("slots", True, 203, 203))
             + [run(2)] + boot(guidance("slots", True, 90, 100)))
         line = self.line(text, "slots")
-        self.assertIn("its edge: left 2, right 2, in FAULT_SEED=1; its reach: left 203, right 203, in FAULT_SEED=1", line)
+        self.assertIn("its edge: left 2, right 2 or nearer, in FAULT_SEED=1; its reach: left 203 or further, right 203, in FAULT_SEED=1", line)
 
     def test_the_edge_floor(self):
         runs = [run(1)] + boot(assertion("slots", "Always", True, True),
@@ -154,7 +154,7 @@ class Report(unittest.TestCase):
         self.assertNotIn("EDGE", text)
         code, text = self.judge(runs, edges="slots  >= 128\n")
         self.assertEqual(code, 1)
-        self.assertIn("EDGE  short               slots  (wanted left >= 128; its reach: left 70)", text)
+        self.assertIn("EDGE  short               slots  (wanted left >= 128; its reach: left 70 or further, as the stream says)", text)
         self.assertIn("short of the edge floor: 1", text)
         # The wrong way round, and a comparison nobody declared.
         code, text = self.judge(runs, edges="slots  <= 3\nno such  >= 1\n")

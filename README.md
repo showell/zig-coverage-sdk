@@ -183,7 +183,7 @@ declared once a run with `hit: false` and no data, as every site is.
 
 **When a guidance line goes out is this SDK's rule**: the first call, and
 every call nearer the edge, or further in its reach (below), than any before
-it in this run. The Go SDK keeps
+it in this run, thinned after the first 16 (below). The Go SDK keeps
 the same extreme per assertion; whether it emits on the same rule is
 unchecked.
 
@@ -191,11 +191,20 @@ unchecked.
 right`), so a full table of 256 is the same edge as a full table of 2. So a
 comparison also keeps its **reach**, the furthest `left` went the way it
 steers, and a guidance line goes out at each new reach as well as each new
-edge; every line is the call's own operands. `report()` and `report.py`
+edge (thinned, below); every line is the call's own operands. `report()` and `report.py`
 print both, and `report.py --edges <file>` is a floor for reaches: a line
 `tcp: slots in use stay within the table  >= 64` fails the runs if that
 comparison's reach never got there (EDGE), and a line naming no comparison,
 or with the sign against the way it steers, is STALE.
+
+**The stream thins; the record does not.** A count that only grows sets a new
+reach at every call, so after a comparison's first 16 lines a guidance line
+goes out only when the edge's distance from the limit halves or the reach
+crosses a power of two. `edge` and `reach` in the kernel's own record, and
+so `report()`, stay exact. A reader of the stream sees each **within a factor
+of two**: the edge it keeps is at most twice as far from the limit as the
+real one, and the reach at least half as far. `report.py` says so ("or
+nearer", "or further"), and an edge floor's numbers are best powers of two.
 
 **One report, two images.** `report.py a.jsonl ... --against b.jsonl ...`
 ends with the difference between the two sets of runs: the properties one

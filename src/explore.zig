@@ -102,8 +102,9 @@ pub const Tape = struct {
         return @intCast(t.ends.items.len);
     }
 
-    /// Rewrites fill `i`, one `uintLessThan(Draw, total)` drawn in one fill,
-    /// to bytes that draw `want`.
+    /// Rewrites fill `i`, the last fill of a `uintLessThan(Draw, total)` (the
+    /// one it kept, after any it rejected), to bytes that draw `want` in one
+    /// fill.
     fn rewrite(t: *Tape, i: u32, comptime Draw: type, total: u64, want: u64) void {
         const start = if (i == 0) 0 else t.ends.items[i - 1];
         const slot = t.bytes.items[start..t.ends.items[i]];
@@ -252,7 +253,10 @@ pub fn pickAs(r: std.Random, comptime Draw: type, comptime name: []const u8, com
     }
     if (tape) |t| if (t.named(name, at, chosen, fields.len)) |forced| {
         chosen = forced;
-        if (t.position() == at + 1) t.rewrite(at, Draw, total, @intCast(starts[forced])) else t.unfaithful = true;
+        // `uintLessThan` may reject a fill and draw again. A rejected fill
+        // is rejected again on replay (the threshold is the total's), so
+        // the fill to rewrite is the last one, the draw that was kept.
+        if (t.position() > at and !t.truncated) t.rewrite(t.position() - 1, Draw, total, @intCast(starts[forced])) else t.unfaithful = true;
     };
     return @enumFromInt(chosen);
 }
@@ -307,6 +311,10 @@ pub const Report = struct {
     /// run. A simulator whose runs drift is not a function of its tape, and
     /// a benchmark of it is not one of steering.
     drifted: u32 = 0,
+    /// Flips whose draw could not be rewritten on the tape (`Tape.unfaithful`):
+    /// the run took the flip, but replaying its tape does not, so a failure
+    /// it found will not reproduce from the tape alone.
+    unfaithful: u32 = 0,
     by_move: [3]u32 = @splat(0),
     /// Runs that found something new to the explorer, by move.
     new_by_move: [3]u32 = @splat(0),
@@ -435,6 +443,7 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
             if (!std.meta.eql(site.reach, b.reach) or !std.meta.eql(site.edge, b.edge)) new = true;
         }
         if (tape.drifted) report.drifted += 1;
+        if (tape.unfaithful) report.unfaithful += 1;
         for (tape.choices.items) |c| {
             const counts = taken.get(c.name) orelse blk: {
                 const fresh_counts = try gpa.alloc(u32, c.alternatives);
@@ -698,6 +707,52 @@ test "pickAs and flag draw as the calls they replace, and their flips replay" {
     }
 }
 
+/// fat_sim's operation: seven alternatives over 100, drawn as
+/// `uintLessThan(u8, 100)`, which rejects a byte now and then (56 of 256)
+/// and draws again.
+fn operations(r: std.Random, out: *std.ArrayList(u64)) !void {
+    for (0..12) |_| {
+        const op = pick(r, "story: the operation", .{ .write = 30, .append = 25, .remove = 10, .rename = 10, .mkdir = 8, .remove_tree = 5, .remount = 12 });
+        try out.append(testing.allocator, @intFromEnum(op));
+        if (op == .remove_tree) try out.append(testing.allocator, r.int(u16));
+    }
+}
+
+test "a flip of a draw that was rejected once and drawn again is written into the tape" {
+    // Found by gopher-metal's `zig build explore`: a flip of fat_sim's
+    // operation whose draw had taken two fills left the tape unfaithful, the
+    // twin run took the unflipped operation, and the run failed for it.
+    var flipped_rejected: u32 = 0;
+    for (0..300) |seed| {
+        var first = Tape.init(testing.allocator, seed);
+        defer first.deinit();
+        var a: std.ArrayList(u64) = .empty;
+        defer a.deinit(testing.allocator);
+        try operations(first.random(), &a);
+        for (first.choices.items, 0..) |c, index| {
+            const next = if (index + 1 < first.choices.items.len) first.choices.items[index + 1].position else first.position();
+            if (next - c.position < 2 or c.chosen == 5) continue; // drawn in one fill, or a remove_tree already
+            var flipped = Tape.branch(testing.allocator, &first, c.position, seed + 1000, .{ .index = @intCast(index), .alternative = 5 });
+            defer flipped.deinit();
+            var b: std.ArrayList(u64) = .empty;
+            defer b.deinit(testing.allocator);
+            try operations(flipped.random(), &b);
+            try testing.expect(!flipped.unfaithful);
+            flipped_rejected += 1;
+
+            var again = Tape.branch(testing.allocator, &flipped, flipped.position(), seed + 2000, null);
+            defer again.deinit();
+            var d: std.ArrayList(u64) = .empty;
+            defer d.deinit(testing.allocator);
+            try operations(again.random(), &d);
+            try testing.expectEqualSlices(u64, b.items, d.items);
+            try testing.expectEqual(@as(u32, 5), again.choices.items[index].chosen);
+            break;
+        }
+    }
+    try testing.expect(flipped_rejected > 20);
+}
+
 test "pick without a tape is a plain weighted choice" {
     var prng = std.Random.DefaultPrng.init(3);
     var yes: u32 = 0;
@@ -764,6 +819,26 @@ test "aimed flips open three rare doors in a few runs" {
     try testing.expect(aimed.decisions >= 6);
 }
 
+test "aiming beats random flips on a tight budget, over fifty explorations" {
+    // At budget 30 both open the three doors every time (metal-vmm QUEUE 94);
+    // at 8 the choice of which decision to flip is what tells them apart.
+    // Each choice has two alternatives, so the alternative is the same
+    // either way. Measured: aimed 25 of 50, random 14 of 50.
+    var aimed: u32 = 0;
+    var random: u32 = 0;
+    for (0..50) |seed| {
+        inline for (.{ true, false }) |aim| {
+            coverage.reset();
+            var report = try explore(testing.allocator, deep, .{ .budget = 8, .seed = seed, .blind = 0.0, .aim = aim });
+            report.deinit(testing.allocator);
+            if (deepSite().hit()) {
+                if (aim) aimed += 1 else random += 1;
+            }
+        }
+    }
+    try testing.expect(aimed >= random + 8);
+}
+
 /// A "simulator" that is not a function of its tape: every other call draws
 /// one byte more.
 var odd_calls: u32 = 0;
@@ -773,6 +848,23 @@ fn unsteady(tape: *Tape) anyerror!void {
     if (odd_calls % 2 == 0) _ = r.int(u8);
     _ = pick(r, "unsteady: a door", .{ .shut = 3, .open = 1 });
     for (0..5) |_| _ = r.int(u32);
+}
+
+/// Marks every flipped run unfaithful, as a flip whose draw cannot be
+/// rewritten is: for the count in the Report.
+fn unrewritable(tape: *Tape) anyerror!void {
+    const r = tape.random();
+    _ = pick(r, "unrewritable: a door", .{ .shut = 3, .open = 1 });
+    if (tape.force != null) tape.unfaithful = true;
+    _ = r.int(u32);
+}
+
+test "a flip that could not be written into the tape is counted" {
+    coverage.reset();
+    var report = try explore(testing.allocator, unrewritable, .{ .budget = 100, .seed = 5, .blind = 0.2 });
+    defer report.deinit(testing.allocator);
+    try testing.expect(report.by_move[@intFromEnum(Move.flip)] > 0);
+    try testing.expectEqual(report.by_move[@intFromEnum(Move.flip)], report.unfaithful);
 }
 
 test "a run that drifts from the tape it replays is counted, and replays no further" {

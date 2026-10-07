@@ -328,9 +328,11 @@ fn compare(comptime src: std.builtin.SourceLocation, comptime kind: Kind, left: 
     recordWith(s, cond, details, ops);
     // **A GUIDANCE LINE AT EACH NEW EDGE, AND EACH NEW REACH**: the first
     // call, every one nearer the edge than any before, and every one whose
-    // `left` went further. Each line is the call's own operands, so a reader
-    // that keeps the best `left - right` gets the edge, and one that keeps
-    // the furthest `left` gets the reach. The Go SDK keeps the same edge;
+    // `left` went further, thinned after the first 16 (`worthPrinting`).
+    // Each line is the call's own operands, so a reader that keeps the best
+    // `left - right` gets the edge within a factor of two, and one that
+    // keeps the furthest `left` gets the reach within a factor of two; the
+    // record here stays exact. The Go SDK keeps the same edge;
     // when it emits is this SDK's rule (README.md, "The numeric comparisons").
     const nearer = ops.nearer(s.edge, kind.maximize());
     const further = ops.further(s.reach, kind.maximize());
