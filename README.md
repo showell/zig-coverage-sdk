@@ -243,6 +243,15 @@ at depth and stays near blind at ten runs. `fast`, `per_name` and `early`
 measured no better than without. All are off by default until gopher-metal's
 own simulators confirm them.
 
+**On gopher-metal's own simulators they did not** (an overnight soak,
+2026-10-07: 7 rounds of 1,000 runs per approach on fat_sim, store_sim and
+tcp_sim). Blind seeds, moments and the allocator reached the same properties
+in every round but one property, which split both ways; no run failed and
+none drifted; the explorer cost 1.3-2× the time. Those simulators are wide and
+shallow, so the options stay off there. The explorer's next subject is the
+real kernel under metal-vmm, steered through its fault decisions (metal-vmm
+`docs/SNAPSHOT.md` is the first step).
+
 ## What is missing, compared with their SDKs
 
 - randomness (`get_random`, `random_choice`) and lifecycle (`setup_complete`,
