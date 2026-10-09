@@ -86,6 +86,21 @@ class Report(unittest.TestCase):
     def line(self, text, prop):
         return next(l for l in text.splitlines() if f" {prop}  (" in l)
 
+    def test_nothing_to_judge_fails(self):
+        # A kernel built without its coverage: runs, and no property at all.
+        code, text = self.judge([run(7, "WIRE_EAT=3"), run(8, "none")])
+        self.assertEqual(code, 1)
+        self.assertIn("SILENT FAULT_SEED=7: it reported no property", text)
+        self.assertIn("nothing to judge: 2 of 2 runs reported no property", text)
+        # One silent run among others that report is still a failure.
+        code, text = self.judge([run(7, "WIRE_EAT=3")] + boot() + [run(8, "none")])
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to judge: 1 of 2 runs reported no property", text)
+        # An empty file: no runs.
+        code, text = self.judge([])
+        self.assertEqual(code, 1)
+        self.assertIn("SILENT no runs at all", text)
+
     def test_marked_runs_count_once_however_many_boots(self):
         code, text = self.judge(
             [run(7, "WIRE_EAT=3")] + boot(assertion("syn", "Sometimes", True, True))

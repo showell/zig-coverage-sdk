@@ -13,6 +13,11 @@ never true, a Reachable or an Always never reached. Antithesis fails both;
 this exits 1 on a FAIL only, because a MISS is a gap in the runs, not a bug
 (README.md, "Where this differs from Antithesis").
 
+SILENT is a run that reported no property at all (a kernel built without
+its coverage, or a run that ended before it declared any). No property
+broken is vacuously true of it, so a report with no properties, or any
+silent run, also exits 1: nothing judged is not a pass.
+
 **A FLOOR** is the list of properties a run is expected to reach: one message
 per line, `#` for comments. With one, a MISS of a property on it fails too,
 and so does a line naming no property any run declared, which is a floor
@@ -107,6 +112,9 @@ class Runs:
 
     def __init__(self):
         self.names = []
+        # Per run, how many property events it wrote: a run that wrote none
+        # was judged on nothing.
+        self.said = []
         self.props = {}
         self.edges = {}
         self.reaches = {}
@@ -129,16 +137,19 @@ class Runs:
         for event in events:
             if RUN_KEY in event:
                 self.names.append(run_name(event[RUN_KEY], path, len(self.names) + 1))
+                self.said.append(0)
                 in_run = True
                 continue
             if "antithesis_sdk" in event:
                 boots += 1
                 if not marked:
                     self.names.append(f"{path}, boot {boots}")
+                    self.said.append(0)
                     in_run = True
                 continue
             if not in_run:
                 self.names.append(path)
+                self.said.append(0)
                 in_run = True
             run = len(self.names) - 1
             if "antithesis_guidance" in event:
@@ -150,6 +161,7 @@ class Runs:
             a = event.get("antithesis_assert")
             if a is None:
                 continue
+            self.said[run] += 1
             p = self.props.setdefault(a["id"], {
                 "display": a["display_type"], "where": a["location"],
                 "true": 0, "false": 0, "first_false": None,
@@ -264,6 +276,19 @@ def main(paths, floor=None, edges=None, there_paths=None):
     under = [id_ for ok, missed, id_, _ in rows if missed and id_ in on_floor]
 
     print(f"{len(names)} runs, {len(props)} properties" + (f", {len(floor)} on the floor" if floor else ""))
+    # **NOTHING TO JUDGE IS NOT A PASS.** No property broken is vacuously
+    # true of a run that reported none: a kernel built without its coverage
+    # (gopher-metal's -Dcoverage), or a run that ended before it declared
+    # any. Such a sweep judged nothing, and says so as a failure.
+    silent = [names[i] for i, n in enumerate(runs.said) if n == 0]
+    if not names or not props or silent:
+        if not names:
+            print("SILENT no runs at all: nothing was judged")
+        for name in silent[:10]:
+            print(f"SILENT {name}: it reported no property (built without its coverage?)")
+        if len(silent) > 10:
+            print(f"SILENT and {len(silent) - 10} more runs like it")
+        print(f"nothing to judge: {len(silent)} of {len(names)} runs reported no property")
     for ok, missed, id_, p in rows:
         where = p["where"]
         verdict = "ok  " if ok else ("FLOOR" if id_ in on_floor else "MISS") if missed else "FAIL"
@@ -315,7 +340,8 @@ def main(paths, floor=None, edges=None, there_paths=None):
             there.read(path)
         for line in against(runs, there):
             print(line)
-    return 1 if broken or under or stale or short else 0
+    nothing = not names or not props or bool(silent)
+    return 1 if broken or under or stale or short or nothing else 0
 
 
 if __name__ == "__main__":

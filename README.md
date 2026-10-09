@@ -158,7 +158,10 @@ These are deliberate choices, not oversights.
   external platform: a test or simulator judges its own run. Both count
   every property that does not hold, MISSes included, so a quick gate that
   fails only on FAILs walks `catalog()` and checks each site's `broken()`.
-  `tools/report.py` exits 1 on a FAIL only, unless given a floor.
+  `tools/report.py` exits 1 on a FAIL only, unless given a floor, and on
+  nothing to judge: a run that reported no property (SILENT), or none at
+  all. A sweep of a kernel built without its coverage once passed a whole
+  night that way ("201 runs, 0 properties").
 
 ## The floor
 
