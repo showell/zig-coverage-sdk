@@ -460,8 +460,12 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
     moment_gpa = gpa;
     const was_hook = coverage.on_moment;
     if (options.moment > 0 or options.bandit) coverage.on_moment = noteMoment;
+    // Finding what breaks is the point: a break is counted, not fatal.
+    const was_broken = coverage.on_broken;
+    coverage.on_broken = null;
     defer {
         coverage.on_moment = was_hook;
+        coverage.on_broken = was_broken;
         moment_tape = null;
         moment_list.deinit(gpa);
     }

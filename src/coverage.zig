@@ -12,7 +12,9 @@
 //! - `@"unreachable"()`: never reached.
 //!
 //! A run that breaks one carries on; the verdict is read at the end, from
-//! `report`, or from the JSONL lines `sink` is handed.
+//! `report`, or from the JSONL lines `sink` is handed. **A unit test is the
+//! exception**: it has no end-of-run verdict to read, so in a test build a
+//! broken invariant fails the test where it broke (`on_broken`).
 //!
 //! **THE CATALOG.** A `sometimes` that never ran must still be reported, so
 //! every assertion has to be known before it is reached. Each call site owns
@@ -261,6 +263,19 @@ pub var sink: ?*const fn (line: []const u8) void = null;
 /// each moment came, to return there (src/explore.zig, `Options.moment`).
 /// Null: nothing is called.
 pub var on_moment: ?*const fn (s: *Site) void = null;
+
+/// **A BROKEN INVARIANT, AS IT HAPPENS**: called each time an `always` (or
+/// an always-comparison) is seen false, or an `unreachable` is reached.
+/// In a test build it is `failTest`, so a unit test that breaks a property
+/// fails there, naming it; a test that breaks one on purpose, or a sweep
+/// that counts them itself (`report`), sets it to null first. Null in any
+/// other build: the run carries on, and the verdict is read at its end.
+pub var on_broken: ?*const fn (s: *const Site) void = if (@import("builtin").is_test) failTest else null;
+
+/// `on_broken` in a test build: the test stops at the property it broke.
+pub fn failTest(s: *const Site) void {
+    std.debug.panic("broken property: \"{s}\" at {s}:{d}", .{ s.message, s.file, s.line });
+}
 
 pub fn always(comptime src: std.builtin.SourceLocation, cond: bool, comptime message: [:0]const u8, details: anytype) void {
     record(site(src, .always, message), cond, details);
@@ -547,6 +562,7 @@ fn record(s: *Site, cond: bool, details: anytype) void {
 fn recordWith(s: *Site, cond: bool, details: anytype, ops: ?Operands) void {
     const first = if (cond) s.passes == 0 else s.fails == 0;
     if (cond) s.passes +|= 1 else s.fails +|= 1;
+    if (!cond and s.broken()) if (on_broken) |f| f(s);
     if (!first) return;
     if (on_moment) |f| f(s);
     const out = sink orelse return;
@@ -776,7 +792,11 @@ fn mine(name: []const u8) *Site {
     @panic("no such site");
 }
 
+/// Breaks "seven is forbidden" on purpose (n > 7), so `on_broken` is off.
 fn exercise(n: u32) void {
+    const was = on_broken;
+    on_broken = null;
+    defer on_broken = was;
     for (0..n) |k| {
         always(@src(), k < 100, "k stays small", .{ .k = k });
         alwaysOrUnreachable(@src(), true, "never reached is fine", null);
@@ -784,6 +804,29 @@ fn exercise(n: u32) void {
         if (k == 1_000) reachable(@src(), "a thousand", null);
         if (k == 7) @"unreachable"(@src(), "seven is \"forbidden\"", .{ .k = k });
     }
+}
+
+var broken_seen: u32 = 0;
+fn countBroken(_: *const Site) void {
+    broken_seen += 1;
+}
+
+test "on_broken: each time an always is seen false or an unreachable reached; never for a miss" {
+    try testing.expect(on_broken == failTest); // a test build fails where it broke
+    reset();
+    sink = null;
+    broken_seen = 0;
+    on_broken = countBroken;
+    defer on_broken = failTest;
+    for (0..3) |k| {
+        always(@src(), k != 1, "on_broken: k is never one", .{ .k = k });
+        sometimes(@src(), k == 9, "on_broken: k reaches nine", null);
+        if (k == 2) @"unreachable"(@src(), "on_broken: k never reaches two", null);
+        alwaysLessThan(@src(), k, 2, "on_broken: k stays under two", null);
+    }
+    // k == 1: the always; k == 2: the unreachable and the comparison. The
+    // sometimes never held, and that is a miss, not a break.
+    try testing.expectEqual(@as(u32, 3), broken_seen);
 }
 
 test "every site is in the catalog before it runs, and judged by its kind" {
@@ -924,6 +967,8 @@ fn freeClusters(n: i64) void {
 }
 
 test "a comparison is its plain kind's verdict, and remembers its edge" {
+    on_broken = null; // breaks an always-comparison on purpose
+    defer on_broken = failTest;
     reset();
     sink = null;
     const s = mine("slots in use stay within the table");
