@@ -23,8 +23,16 @@
 //! compiled, and nothing is merged at run time.
 //!
 //! A call inside a `test` block is skipped: a program never compiles those.
-//! A message that is not a string literal is skipped with a warning, and that
-//! site is cataloged only if its code is compiled.
+//!
+//! **A MESSAGE THAT IS NOT A STRING LITERAL IS REFUSED, NOT WARNED ABOUT**
+//! (metal-vmm QUEUE 165: fail, never warn). The scan cannot catalog such a
+//! site, so it stops, naming it, unless the line just above the call says
+//! why it need not, in a comment that starts
+//!
+//!   // coverage: not scanned, <why>
+//!
+//! (a site whose messages are made at comptime, say, cataloged another way).
+//! A passing scan prints nothing.
 const std = @import("std");
 const Ast = std.zig.Ast;
 
@@ -68,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
 
     var root_dir = try std.Io.Dir.cwd().openDir(io, root, .{});
     defer root_dir.close(io);
+    var refused: usize = 0;
     for (args[3..]) |rel| {
         const src = try root_dir.readFileAllocOptions(io, rel, arena, .unlimited, .of(u8), 0);
         var tree = try Ast.parse(arena, src, .zig);
@@ -76,16 +85,19 @@ pub fn main(init: std.process.Init) !void {
             return error.ParseError;
         }
         try out.print(arena, "    if (comptime std.mem.eql(u8, file, \"{s}\")) {{\n", .{rel});
-        try scanFile(arena, &out, &tree, rel);
+        refused += try scanFile(arena, &out, &tree, rel);
         try out.appendSlice(arena, "    }\n");
     }
     try out.appendSlice(arena, "}\n");
+    if (refused > 0) return error.UnscannableSite;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = out.items });
 }
 
 const Span = struct { first: Ast.TokenIndex, last: Ast.TokenIndex, name: []const u8, is_test: bool };
 
-fn scanFile(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tree: *Ast, file: []const u8) !void {
+/// The sites of one file into `out`; how many it refused.
+fn scanFile(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tree: *Ast, file: []const u8) !usize {
+    var refused: usize = 0;
     // Every fn and test body, so a call can find its innermost enclosure,
     // which is what `@src().fn_name` names.
     var spans: std.ArrayList(Span) = .empty;
@@ -121,10 +133,6 @@ fn scanFile(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tree: *Ast, file: [
 
         const loc = tree.tokenLocation(0, tree.nodeMainToken(src_arg));
         const msg = call.ast.params[k.msg_arg];
-        if (tree.nodeTag(msg) != .string_literal) {
-            std.log.warn("{s}:{d}:{d}: the message is not a string literal, so this site is not cataloged", .{ file, loc.line + 1, loc.column + 1 });
-            continue;
-        }
         var best: ?Span = null;
         for (spans.items) |s| {
             if (s.first <= tree.nodeMainToken(node) and tree.nodeMainToken(node) <= s.last and
@@ -132,8 +140,25 @@ fn scanFile(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tree: *Ast, file: [
         }
         const enclosing = best orelse continue; // at container level: not a call site
         if (enclosing.is_test) continue;
+        if (tree.nodeTag(msg) != .string_literal) {
+            if (explainedAbove(tree.source, loc.line_start)) continue;
+            std.log.err("{s}:{d}:{d}: the message is not a string literal, so the scan cannot catalog this site: give it one, or say why it need not on the line above, as `// coverage: not scanned, <why>`", .{ file, loc.line + 1, loc.column + 1 });
+            refused += 1;
+            continue;
+        }
         try out.print(gpa, "        coverage.register(.{{ .module = module, .file = \"{s}\", .fn_name = \"{s}\", .line = {d}, .column = {d} }}, .{s}, {s});\n", .{
             file, enclosing.name, loc.line + 1, loc.column + 1, k.tag, tree.tokenSlice(tree.nodeMainToken(msg)),
         });
     }
+    return refused;
+}
+
+/// Whether the line before the one starting at `line_start` is a comment
+/// saying why its site is not scanned.
+fn explainedAbove(source: []const u8, line_start: usize) bool {
+    if (line_start == 0) return false;
+    const above_end = line_start - 1; // the newline ending the line above
+    const above_start = if (std.mem.lastIndexOfScalar(u8, source[0..above_end], '\n')) |nl| nl + 1 else 0;
+    const above = std.mem.trim(u8, source[above_start..above_end], " \t\r");
+    return std.mem.startsWith(u8, above, "// coverage: not scanned, ");
 }

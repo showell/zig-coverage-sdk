@@ -52,6 +52,13 @@ fn privateNeverCalled() void {
     coverage.alwaysOrUnreachable(@src(), true, "private, never called", null);
 }
 
+/// A site whose message is made at comptime: the scanner cannot read it, so
+/// it says why it need not, and the site is cataloged when its code is.
+pub fn computedMessage(comptime which: u8) void {
+    // coverage: not scanned, its message is made at comptime, and its site cataloged when compiled
+    coverage.reachable(@src(), std.fmt.comptimePrint("computed {d}", .{which}), null);
+}
+
 test "a test block's assertion is not cataloged by the scanner" {
     coverage.reachable(@src(), "inside a test", null);
 }

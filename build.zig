@@ -54,6 +54,17 @@ pub fn build(b: *std.Build) void {
     // Both: ReleaseSafe is where the optimizer once dropped sites, Debug
     // where zig's own linker leaves slack between them (src/coverage.zig).
     const catalog = addCatalog(b, scan, coverage, b.path("test"), &.{"fixture.zig"});
+    // **A SITE IT CANNOT CATALOG IS REFUSED** (metal-vmm QUEUE 165): the scan
+    // of test/refused.zig must fail, naming the site, where it once warned
+    // and passed.
+    const refuses = b.addRunArtifact(scan);
+    _ = refuses.addOutputFileArg("refused_catalog.zig");
+    refuses.addDirectoryArg(b.path("test"));
+    refuses.addArg("refused.zig");
+    refuses.addFileInput(b.path("test/refused.zig"));
+    refuses.expectExitCode(1);
+    refuses.addCheck(.{ .expect_stderr_match = "refused.zig:8:" });
+    test_step.dependOn(&refuses.step);
     for ([_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe }) |mode| {
         const unit = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/coverage.zig"),

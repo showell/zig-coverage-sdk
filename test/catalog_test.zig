@@ -41,6 +41,9 @@ test "every assertion in the scanned file, called or not, once each" {
             return e;
         };
     }
+    // A site with a computed message is cataloged when its code is compiled.
+    fixture.computedMessage(7);
+    try testing.expectEqual(@as(usize, 1), count("computed 7"));
     // The one that ran, ran; the anytype one both ways, as one site.
     var it = coverage.catalog();
     while (it.next()) |s| {
