@@ -1,5 +1,5 @@
 //! **THE EXPLORER'S LAB** (`zig build lab`): a synthetic story shaped like
-//! gopher-metal's fat_sim, so a change to the explorer is measured in
+//! zig-metal-unikernel's fat_sim, so a change to the explorer is measured in
 //! seconds, not the quarter hour a real simulator's benchmark takes.
 //!
 //! A run makes three scenario choices first (a shape of four, a mode of three,

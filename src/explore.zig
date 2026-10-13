@@ -983,7 +983,7 @@ fn operations(r: std.Random, out: *std.ArrayList(u64)) !void {
 }
 
 test "a flip of a draw that was rejected once and drawn again is written into the tape" {
-    // Found by gopher-metal's `zig build explore`: a flip of fat_sim's
+    // Found by zig-metal-unikernel's `zig build explore`: a flip of fat_sim's
     // operation whose draw had taken two fills left the tape unfaithful, the
     // twin run took the unflipped operation, and the run failed for it.
     var flipped_rejected: u32 = 0;

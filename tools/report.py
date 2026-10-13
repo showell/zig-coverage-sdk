@@ -278,7 +278,7 @@ def main(paths, floor=None, edges=None, there_paths=None):
     print(f"{len(names)} runs, {len(props)} properties" + (f", {len(floor)} on the floor" if floor else ""))
     # **NOTHING TO JUDGE IS NOT A PASS.** No property broken is vacuously
     # true of a run that reported none: a kernel built without its coverage
-    # (gopher-metal's -Dcoverage), or a run that ended before it declared
+    # (zig-metal-unikernel's -Dcoverage), or a run that ended before it declared
     # any. Such a sweep judged nothing, and says so as a failure.
     silent = [names[i] for i, n in enumerate(runs.said) if n == 0]
     if not names or not props or silent:

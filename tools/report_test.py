@@ -207,7 +207,7 @@ class Report(unittest.TestCase):
         self.assertIn("  no difference", text)
 
     def test_long_sh_reads_the_same_lines(self):
-        # gopher-metal's long.sh keeps only these: the verdict prefixes, the
+        # zig-metal-unikernel's long.sh keeps only these: the verdict prefixes, the
         # first line, and the floor's summary.
         _, text = self.judge(boot(), floor="syn\n")
         kept = [l for l in text.splitlines() if l.startswith(("FAIL", "FLOOR", "STALE")) or "under the floor" in l

@@ -61,13 +61,13 @@ them.
 
 ## Who uses it, and what a change here breaks
 
-[gopher-metal](https://github.com/showell/gopher-metal) depends on this repo
+[zig-metal-unikernel](https://github.com/showell/zig-metal-unikernel) depends on this repo
 **by path, with no version pin** (below), so every push to `main` changes its
-build at once. Every change here is a change to gopher-metal's build; say in
-the commit what it would see. The flow: gopher-metal's simulators
+build at once. Every change here is a change to zig-metal-unikernel's build; say in
+the commit what it would see. The flow: zig-metal-unikernel's simulators
 (`zig build properties`) and its `-Dcoverage` kernels (on COM1) emit the
 JSONL; [metal-vmm](https://github.com/showell/metal-vmm) collects a run's
-lines into `COVERAGE_OUT`; gopher-metal's `long.sh` judges them with
+lines into `COVERAGE_OUT`; zig-metal-unikernel's `long.sh` judges them with
 `tools/report.py --floor` against `coverage/floor-sim.txt` and
 `coverage/floor-metal.txt`.
 
@@ -75,7 +75,7 @@ lines into `COVERAGE_OUT`; gopher-metal's `long.sh` judges them with
 
 It's a Zig package (Zig 0.16): the module `coverage`, plus the scanner
 described under "The catalog". Its first user,
-[gopher-metal](https://github.com/showell/gopher-metal), declares it as a
+[zig-metal-unikernel](https://github.com/showell/zig-metal-unikernel), declares it as a
 path dependency on a sibling checkout:
 
 ```zig
@@ -243,10 +243,10 @@ double how often the deepest property is reached (a rare run of four in a row:
 12 explorations to 26; a chain of four rare steps: 15 to 30) and cost a little
 breadth at ten runs; the Thompson-sampling allocator (`bandit`) does as well
 at depth and stays near blind at ten runs. `fast`, `per_name` and `early`
-measured no better than without. All are off by default until gopher-metal's
+measured no better than without. All are off by default until zig-metal-unikernel's
 own simulators confirm them.
 
-**On gopher-metal's own simulators they did not** (an overnight soak,
+**On zig-metal-unikernel's own simulators they did not** (an overnight soak,
 2026-10-07: 7 rounds of 1,000 runs per approach on fat_sim, store_sim and
 tcp_sim). Blind seeds, moments and the allocator reached the same properties
 in every round but one property, which split both ways; no run failed and

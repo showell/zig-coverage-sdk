@@ -375,7 +375,7 @@ const free_lines = 16;
 /// only grows (a log's next byte, the bytes a cache holds) sets a new reach
 /// at every call, and a line at each one flooded a kernel's console: about
 /// 450 lines of 300 bytes in one boot, at an exit a byte under metal-vmm,
-/// long enough to change what the run did (gopher-metal v19's lossy sweep,
+/// long enough to change what the run did (zig-metal-unikernel v19's lossy sweep,
 /// 2026-10-07). So the first `free_lines` new edges and reaches print, and
 /// after them only an edge whose distance from the limit halved, or a reach
 /// that crossed a power of two. `edge` and `reach` keep every call exact for
@@ -442,7 +442,7 @@ pub fn register(comptime src: std.builtin.SourceLocation, comptime kind: Kind, c
 /// **A FILE OF MANY SITES NEEDS MORE COMPTIME THAN ZIG'S DEFAULT.** Every site
 /// is registered in one comptime evaluation, each costing some hundreds of
 /// branches (its function's name searched, its strings copied and hashed), so
-/// a file past about seventy sites ran out of the default 1000 (gopher-metal's
+/// a file past about seventy sites ran out of the default 1000 (zig-metal-unikernel's
 /// fat16.zig, metal-vmm QUEUE item 76). The quota is a ceiling, not a cost.
 pub fn catalogFile(comptime generated: type, comptime here: std.builtin.SourceLocation) void {
     @setEvalBranchQuota(10_000_000);
