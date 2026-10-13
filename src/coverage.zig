@@ -532,6 +532,18 @@ pub fn catalog() Catalog {
     };
 }
 
+/// **THE TAG IS NOT ENOUGH** (metal-vmm QUEUE 198.2): the linker's slack
+/// can begin with it, the rest old code and strings, and a walk that took
+/// it for a site followed a pointer into nothing. A Site also has a kind
+/// that is one of `Kind`'s and a reserved tail of zeros; slack is read as
+/// bytes, never as a Site, until both say it is one.
+fn sound(bytes: *const [site_size]u8) bool {
+    const kind = bytes[@offsetOf(Site, "kind")];
+    if (std.enums.fromInt(Kind, kind) == null) return false;
+    const tail = bytes[@offsetOf(Site, "reserved")..][0..@sizeOf(@FieldType(Site, "reserved"))];
+    return std.mem.allEqual(u8, tail, 0);
+}
+
 pub const Catalog = struct {
     at: usize,
     end: usize,
@@ -540,7 +552,7 @@ pub const Catalog = struct {
         while (c.at + site_size <= c.end) {
             const s: *Site = @ptrFromInt(c.at);
             c.at += site_size;
-            if (s.tag == site_tag) return s;
+            if (s.tag == site_tag and sound(@ptrCast(s))) return s;
         }
         return null;
     }
@@ -1085,4 +1097,17 @@ test "operands: literals, signed and unsigned, floats, and the gap between 64-bi
     const f = Operands.of(@as(f32, 1.5), 2.0);
     try testing.expectEqual(Operands.What.float, f.what);
     try testing.expect(f.nearer(Operands.of(@as(f64, 9.0), 2.0), false));
+}
+
+test "slack that happens to begin with the tag is not a site: its kind and its reserved tail say so (metal-vmm QUEUE 198.2)" {
+    // Three slots: a real site, slack that begins with the tag (as the
+    // linker's padding did in zig-metal-unikernel's unit binary, the rest
+    // its old code and strings), and slack that does not.
+    var region: [3 * site_size]u8 align(site_size) = @splat(0xC5);
+    const real: Site = .{ .kind = .sometimes, .message = "real", .file = "f", .function = "g", .module = "m", .line = 1, .column = 1 };
+    @memcpy(region[0..site_size], std.mem.asBytes(&real));
+    std.mem.writeInt(u64, region[site_size..][0..8], site_tag, .little);
+    var it: Catalog = .{ .at = @intFromPtr(&region), .end = @intFromPtr(&region) + region.len };
+    try testing.expectEqualStrings("real", std.mem.span(it.next().?.message));
+    try testing.expectEqual(@as(?*Site, null), it.next());
 }
