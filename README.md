@@ -62,9 +62,12 @@ them.
 ## Who uses it, and what a change here breaks
 
 [zig-metal-unikernel](https://github.com/showell/zig-metal-unikernel) depends on this repo
-**by path, with no version pin** (below), so every push to `main` changes its
-build at once. Every change here is a change to zig-metal-unikernel's build; say in
-the commit what it would see. The flow: zig-metal-unikernel's simulators
+by path (below), **and pins a commit**: its `build.zig` names one
+(`coverage_sdk_pin`), and its build stops when this checkout's HEAD is any
+other, unless `-Dcoverage-sdk-unpinned` is passed. So a push to `main`
+changes nothing there until the pin moves, and moving the pin is a commit in
+zig-metal-unikernel, made with the change that needs it. Say in a commit
+here what zig-metal-unikernel would see once it moves. The flow: zig-metal-unikernel's simulators
 (`zig build properties`) and its `-Dcoverage` kernels (on COM1) emit the
 JSONL; [metal-vmm](https://github.com/showell/metal-vmm) collects a run's
 lines into `COVERAGE_OUT`; zig-metal-unikernel's `long.sh` judges them with
@@ -91,6 +94,10 @@ const catalog = @import("zig_coverage_sdk").addCatalog(b, sdk.artifact("coverage
 // that compiles a scanned file
 ```
 
+The list of files here is a minimal example. zig-metal-unikernel catalogs
+every file in its `src/` that imports the SDK, but those it names with why
+(its `build.zig`, `not_cataloged`).
+
 Each scanned file says this once, at container level:
 
 ```zig
@@ -111,7 +118,10 @@ a static in a linker section, `zig_coverage_catalog`, and the linker's
 test and each commented where it's handled:
 
 - **Zig's own linker (Debug) leaves gaps between statics.** Each entry is
-  128 bytes, aligned and tagged, and the walk takes only tagged ones.
+  128 bytes, aligned and tagged. The tag is not enough: linker slack can
+  begin with it at a 128-byte step. So the walk takes an entry only if it is
+  tagged, its kind byte is one of `Kind`'s, and its reserved tail is all
+  zeros.
 - **ReleaseSafe dropped sites inside branches it proved dead**, which are
   the sites most worth reporting. Each site is exported under a unique
   hidden name, which keeps it.
@@ -130,7 +140,12 @@ test and each commented where it's handled:
   you name with `std.zig.Ast`, and writes a module that registers each
   assertion it finds, at comptime, as the very `Site` the real call would
   name. `test/` holds the proof: plain, method, `anytype`, generic, nested
-  and private functions nothing calls, all cataloged once. Two limits:
+  and private functions nothing calls, all cataloged once.
+  **A site it cannot catalog stops the scan**: one whose message is not a
+  string literal fails the build with `UnscannableSite`, naming it by
+  file:line:column, unless the line just above the call says why it need
+  not be scanned: `// coverage: not scanned, <why>`. `test/refused.zig` is
+  the proof. Two limits:
   - it matches by name, so another API called `sometimes(@src(), ...)` would
     be cataloged too;
   - a scanned file's assertions in code never compiled for this target,
@@ -236,7 +251,7 @@ moves: **blind** (a fresh seed), **branch** (re-roll from a random point),
 (return to the point where a corpus run first did something new, and re-roll
 or flip just after it). `coverage.on_moment` is the hook the last one uses.
 
-    zig build lab       # every strategy against blind runs on two synthetic stories, about a minute
+    zig build lab       # every strategy against blind runs on two synthetic stories (src/explore_lab.zig's `stories`); its run time is unmeasured here
 
 Measured in the lab (60 explorer seeds, 300 runs, 2026-10-07): moments about
 double how often the deepest property is reached (a rare run of four in a row:
