@@ -62,11 +62,14 @@ them.
 ## Who uses it, and what a change here breaks
 
 [zig-metal-unikernel](https://github.com/showell/zig-metal-unikernel) depends on this repo
-by path (below), **and pins a commit**: its `build.zig` names one
-(`coverage_sdk_pin`), and its build stops when this checkout's HEAD is any
-other, unless `-Dcoverage-sdk-unpinned` is passed. So a push to `main`
-changes nothing there until the pin moves, and moving the pin is a commit in
-zig-metal-unikernel, made with the change that needs it. Say in a commit
+by path (below), **and pins its content**: its `build.zig` names a SHA-256
+(`coverage_sdk_pin`) of every file git tracks here in `build.zig`,
+`build.zig.zon`, `src/` and `tools/`, as the checkout holds them, and its
+build stops when they hash to anything else, unless
+`-Dcoverage-sdk-unpinned` is passed. A commit here that changes none of them
+(this README, `test/`) changes nothing there; one that does stops its build
+until the pin moves, and moving the pin is a commit in zig-metal-unikernel,
+made with the change that needs it (the refusal prints the new hash). Say in a commit
 here what zig-metal-unikernel would see once it moves. The flow: zig-metal-unikernel's simulators
 (`zig build properties`) and its `-Dcoverage` kernels (on COM1) emit the
 JSONL; [metal-vmm](https://github.com/showell/metal-vmm) collects a run's
