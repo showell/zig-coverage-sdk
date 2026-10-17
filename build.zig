@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.step("lab", "the explorer against blind runs on a synthetic story, in seconds").dependOn(&b.addRunArtifact(lab).step);
+    b.step("lab", "the explorer against blind runs on the synthetic stories in src/explore_lab.zig").dependOn(&b.addRunArtifact(lab).step);
 
     const scan = b.addExecutable(.{
         .name = "coverage-scan",
