@@ -189,7 +189,7 @@ blank lines and lines starting with `#` ignored. In-process,
 `FLOOR  never reached: <message>` for a MISS on it and
 `STALE  on the floor, but no such property: <message>` for a line naming no
 site in this program. It ignores FAILs, which are `report`'s. Out of process,
-`tools/report.py --floor floor.txt` reads the same file and also exits 1 on a
+`tools/report.py --floor <floor-file>` reads the same file and also exits 1 on a
 floor MISS or a stale line.
 
 ## The numeric comparisons, on the wire
