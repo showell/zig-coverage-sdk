@@ -77,6 +77,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(linecov);
+    const linecov_unit = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/linecov.zig"),
+        .target = b.graph.host,
+    }) });
     // Its tests: a binary that forks, vforks and spawns a thread, each
     // running a measured line (test/linecov_fork.zig, judged by
     // test/linecov_check.zig); and the Python it ports as its judge, on the
@@ -100,6 +104,7 @@ pub fn build(b: *std.Build) void {
     fork_check.addArtifactArg(fork_fixture);
     fork_check.addFileInput(b.path("test/linecov_fork.zig"));
     test_step.dependOn(&fork_check.step);
+    test_step.dependOn(&b.addRunArtifact(linecov_unit).step);
     const agree = b.addRunArtifact(tool(b, "linecov_agree", "test/linecov_agree.zig"));
     agree.addFileArg(b.path("test/linecov.py"));
     agree.addArtifactArg(linecov);

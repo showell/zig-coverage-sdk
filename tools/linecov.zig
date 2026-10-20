@@ -62,11 +62,16 @@ fn lineTable(a: std.mem.Allocator, io: std.Io, binary: []const u8, sources: []co
         .argv = &.{ "readelf", "--debug-dump=decodedline", binary },
         .stdout_limit = .unlimited,
     });
+    return parseTable(a, out.stdout, sources);
+}
+
+/// `lineTable` of readelf's `decodedline` text.
+fn parseTable(a: std.mem.Allocator, decoded: []const u8, sources: []const Source) !Table {
     var lists: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(Key)) = .empty;
     // A test's root file is named bare (`tcp.zig:`); every other file by
     // its whole path.
     var current: []const u8 = "";
-    var rows = std.mem.splitScalar(u8, out.stdout, '\n');
+    var rows = std.mem.splitScalar(u8, decoded, '\n');
     rows: while (rows.next()) |row| {
         if (row.len > 0 and row[row.len - 1] == ':' and std.mem.indexOfScalar(u8, row, ' ') == null) {
             current = row[0 .. row.len - 1];
@@ -98,6 +103,13 @@ fn lineTable(a: std.mem.Allocator, io: std.Io, binary: []const u8, sources: []co
     var table: Table = .empty;
     for (lists.keys(), lists.values()) |addr, l| try table.put(a, addr, l.items);
     return table;
+}
+
+/// Whether `path` ends with `tail` at a `/`: readelf's file column is a bare
+/// name for the self-hosted backends and a path relative to the module's
+/// root (`std/process.zig`) for LLVM's.
+fn endsWithPath(path: []const u8, tail: []const u8) bool {
+    return std.mem.endsWith(u8, path, tail) and path.len > tail.len and path[path.len - tail.len - 1] == '/';
 }
 
 fn check(rc: usize, what: []const u8) !void {
@@ -354,4 +366,29 @@ fn firstCodepoints(s: []const u8, n: usize) []const u8 {
         _ = iter.nextCodepointSlice() orelse break;
     }
     return s[0..iter.i];
+}
+
+test "a row is the source's only when its own file column names it, whatever the header before it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // As readelf prints a test binary's root line program: the header names
+    // s.zig, and rows of std's process.zig follow with no new header.
+    const decoded =
+        \\/w/s.zig:
+        \\s.zig                                      1           0x12545a0               x
+        \\s.zig                                      2           0x12545a4               x
+        \\process.zig                              808           0x1045170               x
+        \\std/process.zig                          809           0x1045180               x
+        \\
+        \\/w/t.zig:
+        \\t.zig                                      3           0x2000000               x
+        \\
+    ;
+    const sources = [_]Source{.{ .path = "s.zig", .abs = "/w/s.zig", .base = "s.zig", .text = &.{} }};
+    const table = try parseTable(a, decoded, &sources);
+    try std.testing.expectEqual(@as(usize, 2), table.count());
+    try std.testing.expectEqualSlices(Key, &.{key(0, 1)}, table.get(0x12545a0).?);
+    try std.testing.expectEqualSlices(Key, &.{key(0, 2)}, table.get(0x12545a4).?);
+    try std.testing.expect(table.get(0x1045170) == null and table.get(0x1045180) == null);
 }
