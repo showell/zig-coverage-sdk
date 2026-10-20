@@ -226,39 +226,39 @@ const Single = struct {
 /// twin, a reproduction) takes the flip too.
 pub fn pick(r: std.Random, comptime name: []const u8, comptime weights: anytype) std.meta.FieldEnum(@TypeOf(weights)) {
     comptime var total: u64 = 0;
-    inline for (@typeInfo(@TypeOf(weights)).@"struct".fields) |f| total += @field(weights, f.name);
+    inline for (@typeInfo(@TypeOf(weights)).@"struct".field_names) |field| total += @field(weights, field);
     return pickAs(r, if (total <= 255) u8 else u32, name, weights);
 }
 
 /// `pick`, drawn as `uintLessThan(Draw, total)`.
 pub fn pickAs(r: std.Random, comptime Draw: type, comptime name: []const u8, comptime weights: anytype) std.meta.FieldEnum(@TypeOf(weights)) {
-    const fields = @typeInfo(@TypeOf(weights)).@"struct".fields;
+    const names = @typeInfo(@TypeOf(weights)).@"struct".field_names;
     const starts = comptime blk: {
-        var at: [fields.len + 1]u64 = undefined;
+        var at: [names.len + 1]u64 = undefined;
         var sum: u64 = 0;
-        for (fields, 0..) |f, i| {
+        for (names, 0..) |field, i| {
             at[i] = sum;
-            sum += @field(weights, f.name);
+            sum += @field(weights, field);
         }
-        at[fields.len] = sum;
+        at[names.len] = sum;
         break :blk at;
     };
-    const total = starts[fields.len];
+    const total = starts[names.len];
     const tape = Tape.of(r);
     const at: u32 = if (tape) |t| t.position() else 0;
     const draw: u64 = r.uintLessThan(Draw, total);
     var chosen: u32 = 0;
-    inline for (1..fields.len) |i| {
+    inline for (1..names.len) |i| {
         if (draw >= starts[i]) chosen = i;
     }
-    if (tape) |t| if (t.named(name, at, chosen, fields.len)) |forced| {
+    if (tape) |t| if (t.named(name, at, chosen, names.len)) |forced| {
         chosen = forced;
         // `uintLessThan` may reject a fill and draw again. A rejected fill
         // is rejected again on replay (the threshold is the total's), so
         // the fill to rewrite is the last one, the draw that was kept.
         if (t.position() > at and !t.truncated) t.rewrite(t.position() - 1, Draw, total, @intCast(starts[forced])) else t.unfaithful = true;
     };
-    return @enumFromInt(chosen);
+    return @fromBackingInt(@intCast(chosen));
 }
 
 /// **A NAMED YES OR NO**, drawn exactly as `r.boolean()`, so it can replace
@@ -504,7 +504,7 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
             tape.replay_upto = 0;
             tape.replay_from = 0;
         };
-        report.by_move[@intFromEnum(move)] += 1;
+        report.by_move[@backingInt(move)] += 1;
 
         for (sites.items, before) |site, *b| b.* = .{ .passes = site.passes, .fails = site.fails, .reach = site.reach, .edge = site.edge };
         moment_list.clearRetainingCapacity();
@@ -555,15 +555,15 @@ pub fn explore(gpa: Allocator, run: RunFn, options: Options) !Report {
             w.* *= bandit_decay;
             l.* *= bandit_decay;
         }
-        if (novel) wins[@intFromEnum(move)] += 1 else losses[@intFromEnum(move)] += 1;
-        if (novel) report.novel_by_move[@intFromEnum(move)] += 1;
+        if (novel) wins[@backingInt(move)] += 1 else losses[@backingInt(move)] += 1;
+        if (novel) report.novel_by_move[@backingInt(move)] += 1;
         if (failed) {
             keep = true;
             try report.failures.append(gpa, tape);
             continue;
         }
         if (new) {
-            report.new_by_move[@intFromEnum(move)] += 1;
+            report.new_by_move[@backingInt(move)] += 1;
             for (hits.items) |i| reached_by[i] += 1;
             // Its own moments only: a moment lives in the one run that made
             // it, so a property's rarity is its moment's weight, not diluted
@@ -599,7 +599,7 @@ fn thompson(r: std.Random, wins: [moves]f64, losses: [moves]f64) Move {
         const b = x / (x + y);
         if (b > best) {
             best = b;
-            pick_move = @enumFromInt(i);
+            pick_move = @fromBackingInt(@intCast(i));
         }
     }
     return pick_move;
@@ -803,7 +803,7 @@ fn story(r: std.Random, out: *std.ArrayList(u64)) !void {
     try out.append(testing.allocator, r.int(u64));
     try out.append(testing.allocator, r.uintLessThan(u8, 10));
     const big = pick(r, "story: big", .{ .no = 3, .yes = 1 });
-    try out.append(testing.allocator, @intFromEnum(big));
+    try out.append(testing.allocator, @backingInt(big));
     const n: usize = if (big == .yes) 20 else 3;
     for (0..n) |_| try out.append(testing.allocator, r.intRangeAtMost(u64, 0, 1000));
     try out.append(testing.allocator, @intFromBool(r.boolean()));
@@ -931,10 +931,10 @@ test "a flipped tape, replayed, takes the flip" {
 fn wide(r: std.Random, out: *std.ArrayList(u64)) !void {
     try out.append(testing.allocator, r.int(u16));
     const k = pickAs(r, usize, "wide: one of fourteen", .{ .a = 1, .b = 1, .c = 1, .d = 1, .e = 1, .f = 1, .g = 1, .h = 1, .i = 1, .j = 1, .k = 1, .l = 1, .m = 1, .n = 1 });
-    try out.append(testing.allocator, @intFromEnum(k));
+    try out.append(testing.allocator, @backingInt(k));
     const y = flag(r, "wide: yes");
     try out.append(testing.allocator, @intFromBool(y));
-    for (0..@as(usize, if (y) 9 else 2) + @intFromEnum(k)) |_| try out.append(testing.allocator, r.uintLessThan(u64, 77));
+    for (0..@as(usize, if (y) 9 else 2) + @backingInt(k)) |_| try out.append(testing.allocator, r.uintLessThan(u64, 77));
 }
 
 test "pickAs and flag draw as the calls they replace, and their flips replay" {
@@ -977,7 +977,7 @@ test "pickAs and flag draw as the calls they replace, and their flips replay" {
 fn operations(r: std.Random, out: *std.ArrayList(u64)) !void {
     for (0..12) |_| {
         const op = pick(r, "story: the operation", .{ .write = 30, .append = 25, .remove = 10, .rename = 10, .mkdir = 8, .remove_tree = 5, .remount = 12 });
-        try out.append(testing.allocator, @intFromEnum(op));
+        try out.append(testing.allocator, @backingInt(op));
         if (op == .remove_tree) try out.append(testing.allocator, r.int(u16));
     }
 }
@@ -1111,7 +1111,7 @@ fn chain(tape: *Tape) anyerror!void {
     const keys = [_]u8{ 2, 5, 1, 6, 3 };
     var made: usize = 0;
     for (0..40) |_| {
-        const op: u8 = @intFromEnum(pick(r, "chain: the operation", .{ .o0 = 1, .o1 = 1, .o2 = 1, .o3 = 1, .o4 = 1, .o5 = 1, .o6 = 1, .o7 = 1 }));
+        const op: u8 = @backingInt(pick(r, "chain: the operation", .{ .o0 = 1, .o1 = 1, .o2 = 1, .o3 = 1, .o4 = 1, .o5 = 1, .o6 = 1, .o7 = 1 }));
         made = if (made < keys.len and op == keys[made]) made + 1 else 0;
         if (made >= 1) coverage.reachable(@src(), "chain: one link", null);
         if (made >= 2) coverage.reachable(@src(), "chain: two links", null);
@@ -1162,7 +1162,7 @@ test "the hook is put back, and an exploration with moments and the bandit repea
     try testing.expectEqual(before, coverage.on_moment);
     try testing.expectEqual(ends[0], ends[1]);
     try testing.expectEqualSlices(u32, &reports[0].by_move, &reports[1].by_move);
-    try testing.expect(reports[0].by_move[@intFromEnum(Move.moment)] > 0);
+    try testing.expect(reports[0].by_move[@backingInt(Move.moment)] > 0);
 }
 
 /// A "simulator" that is not a function of its tape: every other call draws
@@ -1189,8 +1189,8 @@ test "a flip that could not be written into the tape is counted" {
     coverage.reset();
     var report = try explore(testing.allocator, unrewritable, .{ .budget = 100, .seed = 5, .blind = 0.2 });
     defer report.deinit(testing.allocator);
-    try testing.expect(report.by_move[@intFromEnum(Move.flip)] > 0);
-    try testing.expectEqual(report.by_move[@intFromEnum(Move.flip)], report.unfaithful);
+    try testing.expect(report.by_move[@backingInt(Move.flip)] > 0);
+    try testing.expectEqual(report.by_move[@backingInt(Move.flip)], report.unfaithful);
 }
 
 test "a run that drifts from the tape it replays is counted, and replays no further" {

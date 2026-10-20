@@ -453,13 +453,14 @@ pub fn catalogFile(comptime generated: type, comptime here: std.builtin.SourceLo
 ///
 /// **ONE PER PLACE IN THE SOURCE, HOWEVER MANY INSTANTIATIONS.** In a generic
 /// or `anytype` function `@src().fn_name` names the instantiation
-/// (`transmit__anon_44394`), so each instantiation was a Site of its own, and
+/// (`transmit__func_958` since Zig 0.17; `__anon_` before), so each
+/// instantiation was a Site of its own, and
 /// their exported names collided: a compile error the moment such a function
 /// was called with two types. The suffix is cut, and every string is passed
 /// to `siteOf` as an array, which comptime compares by content; a slice
 /// compares by pointer, and two equal names would still be two Sites.
 fn site(comptime src: std.builtin.SourceLocation, comptime kind: Kind, comptime message: [:0]const u8) *Site {
-    const function = comptime if (std.mem.indexOf(u8, src.fn_name, "__anon_")) |cut| src.fn_name[0..cut] else src.fn_name;
+    const function = comptime if (std.mem.indexOf(u8, src.fn_name, "__func_")) |cut| src.fn_name[0..cut] else src.fn_name;
     return siteOf(kind, arr(src.module), arr(src.file), arr(function), src.line, src.column, arr(message));
 }
 

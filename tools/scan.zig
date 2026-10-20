@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
     var refused: usize = 0;
     for (args[3..]) |rel| {
         const src = try root_dir.readFileAllocOptions(io, rel, arena, .unlimited, .of(u8), 0);
-        var tree = try Ast.parse(arena, src, .zig);
+        var tree = try Ast.parse(arena, src, .{ .mode = .zig });
         if (tree.errors.len != 0) {
             std.log.err("{s}: does not parse", .{rel});
             return error.ParseError;
@@ -102,7 +102,7 @@ fn scanFile(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tree: *Ast, file: [
     // which is what `@src().fn_name` names.
     var spans: std.ArrayList(Span) = .empty;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         switch (tree.nodeTag(node)) {
             .fn_decl => {
                 var buf: [1]Ast.Node.Index = undefined;
@@ -116,7 +116,7 @@ fn scanFile(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tree: *Ast, file: [
     }
 
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buf: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buf, node) orelse continue;
         const name = tree.tokenSlice(tree.lastToken(call.ast.fn_expr));

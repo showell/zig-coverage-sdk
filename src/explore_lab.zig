@@ -79,7 +79,7 @@ fn doors(tape: *explore.Tape) anyerror!void {
     const keys = [_]u8{ 3, 7, 1, 9 };
     var opened: usize = 0;
     for (0..100) |_| {
-        const op: u8 = @intFromEnum(explore.pick(r, "doors: the operation", .{ .o0 = 1, .o1 = 1, .o2 = 1, .o3 = 1, .o4 = 1, .o5 = 1, .o6 = 1, .o7 = 1, .o8 = 1, .o9 = 1 }));
+        const op: u8 = @backingInt(explore.pick(r, "doors: the operation", .{ .o0 = 1, .o1 = 1, .o2 = 1, .o3 = 1, .o4 = 1, .o5 = 1, .o6 = 1, .o7 = 1, .o8 = 1, .o9 = 1 }));
         _ = r.int(u32); // an unnamed draw beside it
         if (arm != .f) continue;
         opened = if (opened < keys.len and op == keys[opened]) opened + 1 else 0;
@@ -131,7 +131,7 @@ pub fn main() !void {
         std.debug.print("  | moves (blind branch flip moment), and the share that found something never seen\n", .{});
         for (columns) |col| {
             var missed: [budgets.len][seeds]f64 = undefined;
-            var reached_in = [_]u32{0} ** 16;
+            var reached_in: [16]u32 = @splat(0);
             var by_move: [4]u64 = @splat(0);
             var novel: [4]u64 = @splat(0);
             for (0..seeds) |seed| {
