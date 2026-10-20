@@ -107,8 +107,9 @@ pub fn build(b: *std.Build) void {
     // functions' first and last rows lines past the end of their file (pick's,
     // lines 1291 and 1541 of a 1,221-line file), and linecov.py dies of an
     // IndexError there; linecov leaves such a line out.
-    agree.addArgs(&.{ "src/coverage.zig", "--" });
+    agree.addArgs(&.{ "src/coverage.zig", "test/linecov_fork.zig", "--" });
     agree.addFileInput(b.path("src/coverage.zig"));
+    agree.addFileInput(b.path("test/linecov_fork.zig"));
     test_step.dependOn(&agree.step);
     for ([_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe }) |mode| {
         const unit = b.addTest(.{ .root_module = b.createModule(.{

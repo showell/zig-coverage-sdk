@@ -3,6 +3,12 @@
 //! ported; metal-vmm QUEUE 241 B).
 //!
 //!     linecov src/tcp.zig <test binary> [<test binary> ...]
+//!     linecov <source> [<source> ...] -- <test binary> [<test binary> ...]
+//!
+//! The second form (not the Python's) measures every source named over one
+//! run of each binary, and prints each one's report, in the order named, as
+//! the first form prints it: a binary that runs a minute is run once, not
+//! once a file.
 //!
 //! Each binary is run once under ptrace with a one-shot breakpoint (0xCC) at
 //! the first address of every line of the file, from its DWARF line table
@@ -32,15 +38,31 @@ const PTRACE = linux.PTRACE;
 /// user_regs_struct's rip, in 8-byte words.
 const rip = 16;
 
-/// {address: lines} for the lines of `source` (a path ending) in `binary`.
-const Table = std.AutoArrayHashMapUnmanaged(usize, []const u32);
+/// A source measured: its path as named, the two names readelf may give
+/// it, and its lines.
+const Source = struct {
+    path: []const u8,
+    abs: []const u8,
+    base: []const u8,
+    text: []const []const u8,
+};
 
-fn lineTable(a: std.mem.Allocator, io: std.Io, binary: []const u8, source_abs: []const u8, source_base: []const u8) !Table {
+/// A line of a source: `source << 32 | line`.
+const Key = u64;
+
+fn key(source: usize, line: u32) Key {
+    return @as(Key, source) << 32 | line;
+}
+
+/// {address: the lines of the sources whose first row is there} in `binary`.
+const Table = std.AutoArrayHashMapUnmanaged(usize, []const Key);
+
+fn lineTable(a: std.mem.Allocator, io: std.Io, binary: []const u8, sources: []const Source) !Table {
     const out = try std.process.run(a, io, .{
         .argv = &.{ "readelf", "--debug-dump=decodedline", binary },
         .stdout_limit = .unlimited,
     });
-    var lists: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(u32)) = .empty;
+    var lists: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(Key)) = .empty;
     // A test's root file is named bare (`tcp.zig:`); every other file by
     // its whole path.
     var current: []const u8 = "";
@@ -50,7 +72,6 @@ fn lineTable(a: std.mem.Allocator, io: std.Io, binary: []const u8, source_abs: [
             current = row[0 .. row.len - 1];
             continue;
         }
-        if (!(std.mem.eql(u8, current, source_abs) or std.mem.eql(u8, current, source_base))) continue;
         // `(\S+)\s+(\d+)\s+(0x[0-9a-f]+)` from the row's start.
         if (row.len == 0 or std.ascii.isWhitespace(row[0])) continue;
         var words = std.mem.tokenizeAny(u8, row, " \t\r\x0b\x0c");
@@ -64,11 +85,15 @@ fn lineTable(a: std.mem.Allocator, io: std.Io, binary: []const u8, source_abs: [
         while (end < addr_word.len and (std.ascii.isDigit(addr_word[end]) or (addr_word[end] >= 'a' and addr_word[end] <= 'f'))) end += 1;
         if (end == 2) continue;
         const addr = std.fmt.parseInt(usize, addr_word[2..end], 16) catch continue;
-        const slot = try lists.getOrPut(a, addr);
-        if (!slot.found_existing) slot.value_ptr.* = .empty;
-        for (slot.value_ptr.items) |l| {
-            if (l == line) break;
-        } else try slot.value_ptr.append(a, line);
+        for (sources, 0..) |src, i| {
+            if (!(std.mem.eql(u8, current, src.abs) or std.mem.eql(u8, current, src.base))) continue;
+            const slot = try lists.getOrPut(a, addr);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            const k = key(i, line);
+            for (slot.value_ptr.items) |l| {
+                if (l == k) break;
+            } else try slot.value_ptr.append(a, k);
+        }
     }
     var table: Table = .empty;
     for (lists.keys(), lists.values()) |addr, l| try table.put(a, addr, l.items);
@@ -125,7 +150,7 @@ const wall = 0x40000000;
 ///
 /// Runs `binary` to its end, the lines it hit added to `hit`; its exit
 /// status, or minus the signal that ended it.
-fn run(a: std.mem.Allocator, binary: [:0]const u8, envp: [*:null]const ?[*:0]const u8, table: Table, hit: *std.AutoArrayHashMapUnmanaged(u32, void)) !i32 {
+fn run(a: std.mem.Allocator, binary: [:0]const u8, envp: [*:null]const ?[*:0]const u8, table: Table, hit: *std.AutoArrayHashMapUnmanaged(Key, void)) !i32 {
     const fork_rc = linux.fork();
     try check(fork_rc, "fork");
     const leader: linux.pid_t = @intCast(fork_rc);
@@ -239,31 +264,43 @@ pub fn main(init: std.process.Init) !u8 {
     var out_w = std.Io.File.stdout().writer(io, &out_buf);
     const out = &out_w.interface;
     defer out.flush() catch {};
-    if (args.len < 3) {
-        try out.writeAll("linecov src/tcp.zig <test binary> [<test binary> ...]\n");
+    const dash = for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--")) break i;
+    } else null;
+    const named, const binaries = if (dash) |d| .{ args[1..d], args[d + 1 ..] } else if (args.len >= 3) .{ args[1..2], args[2..] } else .{ args[0..0], args[0..0] };
+    if (named.len == 0 or binaries.len == 0) {
+        try out.writeAll("linecov src/tcp.zig <test binary> [<test binary> ...]\n" ++
+            "linecov <source> [<source> ...] -- <test binary> [<test binary> ...]\n");
         return 2;
     }
-    const source = args[1];
-    const binaries = args[2..];
     const cwd = try std.process.currentPathAlloc(io, a);
-    const source_abs = try std.fs.path.resolve(a, &.{ cwd, source });
-    const source_base = std.fs.path.basename(source);
-    const file_text = try std.Io.Dir.cwd().readFileAlloc(io, source, a, .unlimited);
-    var text: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, file_text, '\n');
-    while (it.next()) |l| try text.append(a, std.mem.trimEnd(u8, l, "\r"));
-    if (text.items.len > 0 and std.mem.endsWith(u8, file_text, "\n")) _ = text.pop();
+    const sources = try a.alloc(Source, named.len);
+    for (named, sources) |path, *src| {
+        const file_text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
+        var text: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, file_text, '\n');
+        while (it.next()) |l| try text.append(a, std.mem.trimEnd(u8, l, "\r"));
+        if (text.items.len > 0 and std.mem.endsWith(u8, file_text, "\n")) _ = text.pop();
+        src.* = .{ .path = path, .abs = try std.fs.path.resolve(a, &.{ cwd, path }), .base = std.fs.path.basename(path), .text = text.items };
+    }
     const envp: [*:null]const ?[*:0]const u8 = init.minimal.environ.block.slice.ptr;
 
-    var have: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
-    var ran: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+    // `have` is the lines with code (a closing brace alone is not one),
+    // `ran` the ones run, of every source.
+    var have: std.AutoArrayHashMapUnmanaged(Key, void) = .empty;
+    var ran: std.AutoArrayHashMapUnmanaged(Key, void) = .empty;
     var crashed: std.ArrayList([]const u8) = .empty;
     for (binaries) |b| {
-        const table = try lineTable(a, io, b, source_abs, source_base);
-        if (table.count() == 0) continue; // another binary's tests reach this file, not this one's
-        for (table.values()) |lines| for (lines) |n| {
-            if (n == 0 or n > text.items.len) continue;
-            if (!std.mem.eql(u8, std.mem.trim(u8, text.items[n - 1], " \t\r\n\x0b\x0c"), "}")) try have.put(a, n, {});
+        const table = try lineTable(a, io, b, sources);
+        if (table.count() == 0) continue; // another binary's tests reach these files, not this one's
+        for (table.values()) |keys| for (keys) |k| {
+            const text = sources[@intCast(k >> 32)].text;
+            const n: u32 = @truncate(k);
+            // A line past the file's end: Zig 0.17's x86_64 backend gives
+            // some generic functions' first and last rows one (linecov.py
+            // dies of an IndexError there).
+            if (n == 0 or n > text.len) continue;
+            if (!std.mem.eql(u8, std.mem.trim(u8, text[n - 1], " \t\r\n\x0b\x0c"), "}")) try have.put(a, k, {});
         };
         const code = try run(a, b, envp, table, &ran);
         if (code != 0) {
@@ -271,21 +308,29 @@ pub fn main(init: std.process.Init) !u8 {
             try crashed.append(a, std.fs.path.basename(b));
         }
     }
-    if (have.count() == 0) {
-        try out.print("linecov: none of the {d} binaries has a line of {s}\n", .{ binaries.len, source });
-        return 2;
-    }
-    var ran_count: usize = 0;
-    var missed: std.ArrayList(u32) = .empty;
-    for (have.keys()) |n| {
-        if (ran.contains(n)) ran_count += 1 else try missed.append(a, n);
-    }
-    std.mem.sort(u32, missed.items, {}, lessThan);
-    const pct = 100.0 * @as(f64, @floatFromInt(ran_count)) / @as(f64, @floatFromInt(have.count()));
-    try out.print("{s}: {d} of {d} lines with code ran ({d:.1}%), over {d} binaries\n", .{ source, ran_count, have.count(), pct, binaries.len });
-    for (missed.items) |n| {
-        const line = std.mem.trim(u8, text.items[n - 1], " \t\r\n\x0b\x0c");
-        try out.print("  {d:>5}  {s}\n", .{ n, firstCodepoints(line, 100) });
+    var exit: u8 = 0;
+    for (sources, 0..) |src, i| {
+        var have_count: usize = 0;
+        var ran_count: usize = 0;
+        var missed: std.ArrayList(u32) = .empty;
+        for (have.keys()) |k| {
+            if (k >> 32 != i) continue;
+            have_count += 1;
+            if (ran.contains(k)) ran_count += 1 else try missed.append(a, @truncate(k));
+        }
+        if (have_count == 0) {
+            try out.print("linecov: none of the {d} binaries has a line of {s}\n", .{ binaries.len, src.path });
+            if (sources.len == 1) return 2;
+            exit = 2;
+            continue;
+        }
+        std.mem.sort(u32, missed.items, {}, lessThan);
+        const pct = 100.0 * @as(f64, @floatFromInt(ran_count)) / @as(f64, @floatFromInt(have_count));
+        try out.print("{s}: {d} of {d} lines with code ran ({d:.1}%), over {d} binaries\n", .{ src.path, ran_count, have_count, pct, binaries.len });
+        for (missed.items) |n| {
+            const line = std.mem.trim(u8, src.text[n - 1], " \t\r\n\x0b\x0c");
+            try out.print("  {d:>5}  {s}\n", .{ n, firstCodepoints(line, 100) });
+        }
     }
     // **A BINARY THAT DID NOT FINISH FAILS THE MEASURE** (metal-vmm 146(d)):
     // a crash anywhere cuts every file's coverage short, and a short measure
@@ -296,7 +341,7 @@ pub fn main(init: std.process.Init) !u8 {
         try out.writeAll(" did not finish; the lines above are short\n");
         return 1;
     }
-    return 0;
+    return exit;
 }
 
 /// The first `n` code points of `s` (Python's `s[:n]`), or its bytes as they
