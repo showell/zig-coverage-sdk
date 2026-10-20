@@ -104,6 +104,19 @@ pub fn build(b: *std.Build) void {
     fork_check.addArtifactArg(fork_fixture);
     fork_check.addFileInput(b.path("test/linecov_fork.zig"));
     test_step.dependOn(&fork_check.step);
+    // A generic whose misplaced rows land on comment lines inside its file
+    // (Zig 0.17.0; metal-vmm QUEUE 243): linecov refuses them, saying so.
+    const generic_fixture = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/linecov_generic.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    }) });
+    const generic_check = b.addRunArtifact(tool(b, "linecov_generic_check", "test/linecov_generic_check.zig"));
+    generic_check.addArtifactArg(linecov);
+    generic_check.addArg("test/linecov_generic.zig");
+    generic_check.addArtifactArg(generic_fixture);
+    generic_check.addFileInput(b.path("test/linecov_generic.zig"));
+    test_step.dependOn(&generic_check.step);
     test_step.dependOn(&b.addRunArtifact(linecov_unit).step);
     const agree = b.addRunArtifact(tool(b, "linecov_agree", "test/linecov_agree.zig"));
     agree.addFileArg(b.path("test/linecov.py"));
