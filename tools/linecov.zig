@@ -29,7 +29,14 @@
 //! address, a later row replacing an earlier), where readelf lists every
 //! row and linecov.py takes every line a row names at an address. Reading
 //! the same table as the Python makes the two agree on what a file's lines
-//! are, so what is left to compare is the tracing.
+//! are, so what is left to compare is the tracing. `decodedline` prints no
+//! column, so each row's comes from the raw line program (`rawline`), which
+//! makes the same rows in the same order: the two are read side by side, and
+//! a row at another address than its column's stops the measure.
+//!
+//! **A ROW IS REFUSED, AND COUNTED,** when its line is past the file's end,
+//! holds no code, or ends before the row's column (`refused`): Zig 0.17.0's
+//! misplaced generic rows (metal-vmm QUEUE 243). The report says how many.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -54,20 +61,89 @@ fn key(source: usize, line: u32) Key {
     return @as(Key, source) << 32 | line;
 }
 
-/// {address: the lines of the sources whose first row is there} in `binary`.
-const Table = std.AutoArrayHashMapUnmanaged(usize, []const Key);
+/// {address: the lines of the sources whose first row is there} in `binary`,
+/// and how many rows of each source were refused.
+const Table = struct {
+    lines: std.AutoArrayHashMapUnmanaged(usize, []const Key),
+    refused: []usize,
+};
+
+/// A row of the line program, as readelf's `rawline` dump gives it: the
+/// address and the column `decodedline` leaves out.
+const Column = struct { addr: usize, column: u32 };
 
 fn lineTable(a: std.mem.Allocator, io: std.Io, binary: []const u8, sources: []const Source) !Table {
-    const out = try std.process.run(a, io, .{
+    const decoded = try std.process.run(a, io, .{
         .argv = &.{ "readelf", "--debug-dump=decodedline", binary },
         .stdout_limit = .unlimited,
     });
-    return parseTable(a, out.stdout, sources);
+    const raw = try std.process.run(a, io, .{
+        .argv = &.{ "readelf", "--debug-dump=rawline", binary },
+        .stdout_limit = .unlimited,
+    });
+    return parseTable(a, decoded.stdout, try parseColumns(a, raw.stdout), sources);
 }
 
-/// `lineTable` of readelf's `decodedline` text.
-fn parseTable(a: std.mem.Allocator, decoded: []const u8, sources: []const Source) !Table {
+/// Every row's address and column, in the order the line programs make them,
+/// which is the order `decodedline` lists them in.
+fn parseColumns(a: std.mem.Allocator, raw: []const u8) ![]const Column {
+    var rows: std.ArrayList(Column) = .empty;
+    var addr: usize = 0;
+    var column: u32 = 0;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |l| {
+        if (after(l, "Set column to ")) |rest| {
+            column = std.fmt.parseInt(u32, firstWord(rest), 10) catch continue;
+        } else if (after(l, "set Address to 0x")) |rest| {
+            addr = std.fmt.parseInt(usize, firstWord(rest), 16) catch continue;
+        } else if (std.mem.indexOf(u8, l, "Advance PC by ") != null) {
+            addr = std.fmt.parseInt(usize, firstWord(after(l, " to 0x") orelse continue), 16) catch continue;
+        } else if (std.mem.indexOf(u8, l, "Special opcode ") != null) {
+            addr = std.fmt.parseInt(usize, firstWord(after(l, " to 0x") orelse continue), 16) catch continue;
+            try rows.append(a, .{ .addr = addr, .column = column });
+        } else if (std.mem.indexOf(u8, l, "]  Copy") != null) {
+            try rows.append(a, .{ .addr = addr, .column = column });
+        } else if (std.mem.indexOf(u8, l, "End of Sequence") != null) {
+            try rows.append(a, .{ .addr = addr, .column = column });
+            // A sequence's end resets the registers.
+            column = 0;
+        }
+    }
+    return rows.items;
+}
+
+/// What follows `marker` in `l`, or null.
+fn after(l: []const u8, marker: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, l, marker) orelse return null;
+    return l[at + marker.len ..];
+}
+
+fn firstWord(s: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < s.len and std.ascii.isAlphanumeric(s[end])) end += 1;
+    return s[0..end];
+}
+
+/// **A ROW IS REFUSED** when its line is not in the source, or holds no code
+/// (a blank line, a comment alone), or its column is past the line's end
+/// plus one: Zig 0.17.0 gives a generic instance's first and last rows lines
+/// its source never had (metal-vmm QUEUE 243), inside the file or past its
+/// end, and a row there would credit or blame a line with nothing to run.
+fn refused(text: []const []const u8, line: u32, column: u32) bool {
+    if (line == 0 or line > text.len) return true;
+    const t = text[line - 1];
+    const code = std.mem.trim(u8, t, " \t\r\x0b\x0c");
+    if (code.len == 0 or std.mem.startsWith(u8, code, "//")) return true;
+    return column > t.len + 1;
+}
+
+/// `lineTable` of readelf's `decodedline` text, each row held to its column
+/// in `columns` (`parseColumns`, the same rows in the same order).
+fn parseTable(a: std.mem.Allocator, decoded: []const u8, columns: []const Column, sources: []const Source) !Table {
     var lists: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(Key)) = .empty;
+    const refusals = try a.alloc(usize, sources.len);
+    @memset(refusals, 0);
+    var row_index: usize = 0;
     // A test's root file is named bare (`tcp.zig:`); every other file by
     // its whole path.
     var current: []const u8 = "";
@@ -83,13 +159,19 @@ fn parseTable(a: std.mem.Allocator, decoded: []const u8, sources: []const Source
         const row_file = words.next() orelse continue;
         const line_word = words.next() orelse continue;
         const addr_word = words.next() orelse continue;
-        for (line_word) |c| if (!std.ascii.isDigit(c)) continue :rows;
-        const line = std.fmt.parseInt(u32, line_word, 10) catch continue;
         if (!std.mem.startsWith(u8, addr_word, "0x")) continue;
         var end: usize = 2;
         while (end < addr_word.len and (std.ascii.isDigit(addr_word[end]) or (addr_word[end] >= 'a' and addr_word[end] <= 'f'))) end += 1;
         if (end == 2) continue;
         const addr = std.fmt.parseInt(usize, addr_word[2..end], 16) catch continue;
+        // A row, its line a number or `-` (a sequence's end): the next of
+        // `columns`, which must be at the same address.
+        if (!std.mem.eql(u8, line_word, "-")) for (line_word) |c| if (!std.ascii.isDigit(c)) continue :rows;
+        if (row_index >= columns.len or columns[row_index].addr != addr) return error.ColumnsDisagree;
+        const column = columns[row_index].column;
+        row_index += 1;
+        if (std.mem.eql(u8, line_word, "-")) continue;
+        const line = std.fmt.parseInt(u32, line_word, 10) catch continue;
         for (sources, 0..) |src, i| {
             if (!(std.mem.eql(u8, current, src.abs) or std.mem.eql(u8, current, src.base))) continue;
             // readelf names a row's own file in its first column, and does not
@@ -97,6 +179,10 @@ fn parseTable(a: std.mem.Allocator, decoded: []const u8, sources: []const Source
             // file: a row of std's process.zig can follow a header naming the
             // test's root. A row is the source's only when both say so.
             if (!(std.mem.eql(u8, row_file, src.base) or endsWithPath(src.abs, row_file))) continue;
+            if (refused(src.text, line, column)) {
+                refusals[i] += 1;
+                continue;
+            }
             const slot = try lists.getOrPut(a, addr);
             if (!slot.found_existing) slot.value_ptr.* = .empty;
             const k = key(i, line);
@@ -105,8 +191,9 @@ fn parseTable(a: std.mem.Allocator, decoded: []const u8, sources: []const Source
             } else try slot.value_ptr.append(a, k);
         }
     }
-    var table: Table = .empty;
-    for (lists.keys(), lists.values()) |addr, l| try table.put(a, addr, l.items);
+    if (row_index != columns.len) return error.ColumnsDisagree;
+    var table: Table = .{ .lines = .empty, .refused = refusals };
+    for (lists.keys(), lists.values()) |addr, l| try table.lines.put(a, addr, l.items);
     return table;
 }
 
@@ -185,7 +272,7 @@ fn run(a: std.mem.Allocator, binary: [:0]const u8, envp: [*:null]const ?[*:0]con
     var original: std.AutoArrayHashMapUnmanaged(usize, u8) = .empty;
     // The addresses still patched in the leader's memory.
     var saved: std.AutoArrayHashMapUnmanaged(usize, void) = .empty;
-    for (table.keys()) |addr| {
+    for (table.lines.keys()) |addr| {
         try original.put(a, addr, try pokeByte(leader, addr, 0xCC));
         try saved.put(a, addr, {});
     }
@@ -239,7 +326,7 @@ fn run(a: std.mem.Allocator, binary: [:0]const u8, envp: [*:null]const ?[*:0]con
             const at = regs[rip] -% 1;
             if (original.get(at)) |byte| {
                 if (saved.swapRemove(at)) {
-                    for (table.get(at).?) |l| try hit.put(a, l, {});
+                    for (table.lines.get(at).?) |l| try hit.put(a, l, {});
                     _ = try pokeByte(pid, at, byte);
                 }
                 // Hit here, or by another task that hit it before it was put back.
@@ -307,16 +394,22 @@ pub fn main(init: std.process.Init) !u8 {
     var have: std.AutoArrayHashMapUnmanaged(Key, void) = .empty;
     var ran: std.AutoArrayHashMapUnmanaged(Key, void) = .empty;
     var crashed: std.ArrayList([]const u8) = .empty;
+    // Rows refused (`refused`), each source's, over every binary.
+    const refusals = try a.alloc(usize, sources.len);
+    @memset(refusals, 0);
     for (binaries) |b| {
-        const table = try lineTable(a, io, b, sources);
-        if (table.count() == 0) continue; // another binary's tests reach these files, not this one's
-        for (table.values()) |keys| for (keys) |k| {
+        const table = lineTable(a, io, b, sources) catch |e| switch (e) {
+            error.ColumnsDisagree => {
+                try out.print("linecov: {s}: readelf's decoded rows and its raw line program disagree; no row's column is known\n", .{std.fs.path.basename(b)});
+                return 1;
+            },
+            else => return e,
+        };
+        for (table.refused, refusals) |n, *total| total.* += n;
+        if (table.lines.count() == 0) continue; // another binary's tests reach these files, not this one's
+        for (table.lines.values()) |keys| for (keys) |k| {
             const text = sources[@intCast(k >> 32)].text;
             const n: u32 = @truncate(k);
-            // A line past the file's end: Zig 0.17's x86_64 backend gives
-            // some generic functions' first and last rows one (linecov.py
-            // dies of an IndexError there).
-            if (n == 0 or n > text.len) continue;
             if (!std.mem.eql(u8, std.mem.trim(u8, text[n - 1], " \t\r\n\x0b\x0c"), "}")) try have.put(a, k, {});
         };
         const code = try run(a, b, envp, table, &ran);
@@ -344,6 +437,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.mem.sort(u32, missed.items, {}, lessThan);
         const pct = 100.0 * @as(f64, @floatFromInt(ran_count)) / @as(f64, @floatFromInt(have_count));
         try out.print("{s}: {d} of {d} lines with code ran ({d:.1}%), over {d} binaries\n", .{ src.path, ran_count, have_count, pct, binaries.len });
+        // Never silent: the misplaced rows are Zig's, and the next such bug's.
+        if (refusals[i] > 0) try out.print("  {d} rows refused: line or column outside the source, or a line with no code\n", .{refusals[i]});
         for (missed.items) |n| {
             const line = std.mem.trim(u8, src.text[n - 1], " \t\r\n\x0b\x0c");
             try out.print("  {d:>5}  {s}\n", .{ n, firstCodepoints(line, 100) });
@@ -390,10 +485,40 @@ test "a row is the source's only when its own file column names it, whatever the
         \\t.zig                                      3           0x2000000               x
         \\
     ;
-    const sources = [_]Source{.{ .path = "s.zig", .abs = "/w/s.zig", .base = "s.zig", .text = &.{} }};
-    const table = try parseTable(a, decoded, &sources);
-    try std.testing.expectEqual(@as(usize, 2), table.count());
-    try std.testing.expectEqualSlices(Key, &.{key(0, 1)}, table.get(0x12545a0).?);
-    try std.testing.expectEqualSlices(Key, &.{key(0, 2)}, table.get(0x12545a4).?);
-    try std.testing.expect(table.get(0x1045170) == null and table.get(0x1045180) == null);
+    const sources = [_]Source{.{ .path = "s.zig", .abs = "/w/s.zig", .base = "s.zig", .text = &.{ "const x = 1;", "const y = 2;" } }};
+    const columns = [_]Column{ .{ .addr = 0x12545a0, .column = 1 }, .{ .addr = 0x12545a4, .column = 7 }, .{ .addr = 0x1045170, .column = 5 }, .{ .addr = 0x1045180, .column = 5 }, .{ .addr = 0x2000000, .column = 1 } };
+    const table = try parseTable(a, decoded, &columns, &sources);
+    try std.testing.expectEqual(@as(usize, 2), table.lines.count());
+    try std.testing.expectEqualSlices(Key, &.{key(0, 1)}, table.lines.get(0x12545a0).?);
+    try std.testing.expectEqualSlices(Key, &.{key(0, 2)}, table.lines.get(0x12545a4).?);
+    try std.testing.expect(table.lines.get(0x1045170) == null and table.lines.get(0x1045180) == null);
+    try std.testing.expectEqual(@as(usize, 0), table.refused[0]);
+}
+
+test "a row is refused when its line is not the source's, holds no code, or ends before its column; and a row out of step with the columns stops the read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const decoded =
+        \\/w/s.zig:
+        \\s.zig                                      1           0x1000               x
+        \\s.zig                                      2           0x1004               x
+        \\s.zig                                      3           0x1008               x
+        \\s.zig                                      4           0x100c               x
+        \\s.zig                                      9           0x1010               x
+        \\s.zig                                      -           0x1014
+        \\
+    ;
+    const sources = [_]Source{.{ .path = "s.zig", .abs = "/w/s.zig", .base = "s.zig", .text = &.{ "const x = 1;", "", "// a comment", "f();" } }};
+    // Line 1 holds; 2 is blank; 3 a comment; 4 has 4 bytes, so column 6 is past
+    // its end plus one; 9 is past the file's end.
+    const columns = [_]Column{ .{ .addr = 0x1000, .column = 13 }, .{ .addr = 0x1004, .column = 1 }, .{ .addr = 0x1008, .column = 1 }, .{ .addr = 0x100c, .column = 6 }, .{ .addr = 0x1010, .column = 1 }, .{ .addr = 0x1014, .column = 0 } };
+    const table = try parseTable(a, decoded, &columns, &sources);
+    try std.testing.expectEqual(@as(usize, 1), table.lines.count());
+    try std.testing.expectEqualSlices(Key, &.{key(0, 1)}, table.lines.get(0x1000).?);
+    try std.testing.expectEqual(@as(usize, 4), table.refused[0]);
+    var out_of_step = columns;
+    out_of_step[2].addr = 0x2000;
+    try std.testing.expectError(error.ColumnsDisagree, parseTable(a, decoded, &out_of_step, &sources));
+    try std.testing.expectError(error.ColumnsDisagree, parseTable(a, decoded, columns[0..5], &sources));
 }
