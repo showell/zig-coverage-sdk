@@ -65,6 +65,51 @@ pub fn build(b: *std.Build) void {
     refuses.expectExitCode(1);
     refuses.addCheck(.{ .expect_stderr_match = "refused.zig:8:" });
     test_step.dependOn(&refuses.step);
+    // **LINE COVERAGE** (tools/linecov.zig, metal-vmm QUEUE 241 B): the
+    // lines of a source file its test binaries ran, under ptrace. An
+    // application runs `sdk.artifact("linecov")` with the file and the
+    // binaries (Debug, non-PIE x86-64 Linux, as `zig build test` makes).
+    const linecov = b.addExecutable(.{
+        .name = "linecov",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/linecov.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    b.installArtifact(linecov);
+    // Its tests: a binary that forks, vforks and spawns a thread, each
+    // running a measured line (test/linecov_fork.zig, judged by
+    // test/linecov_check.zig); and the Python it ports as its judge, on the
+    // SDK's own Debug unit binaries (test/linecov_agree.zig).
+    const tool = struct {
+        fn exe(bb: *std.Build, name: []const u8, path: []const u8) *std.Build.Step.Compile {
+            return bb.addExecutable(.{ .name = name, .root_module = bb.createModule(.{
+                .root_source_file = bb.path(path),
+                .target = bb.graph.host,
+            }) });
+        }
+    }.exe;
+    const fork_fixture = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/linecov_fork.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    }) });
+    const fork_check = b.addRunArtifact(tool(b, "linecov_check", "test/linecov_check.zig"));
+    fork_check.addArtifactArg(linecov);
+    fork_check.addArg("test/linecov_fork.zig");
+    fork_check.addArtifactArg(fork_fixture);
+    fork_check.addFileInput(b.path("test/linecov_fork.zig"));
+    test_step.dependOn(&fork_check.step);
+    const agree = b.addRunArtifact(tool(b, "linecov_agree", "test/linecov_agree.zig"));
+    agree.addFileArg(b.path("test/linecov.py"));
+    agree.addArtifactArg(linecov);
+    // Not src/explore.zig: Zig 0.17's x86_64 backend gives some generic
+    // functions' first and last rows lines past the end of their file (pick's,
+    // lines 1291 and 1541 of a 1,221-line file), and linecov.py dies of an
+    // IndexError there; linecov leaves such a line out.
+    agree.addArgs(&.{ "src/coverage.zig", "--" });
+    agree.addFileInput(b.path("src/coverage.zig"));
+    test_step.dependOn(&agree.step);
     for ([_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe }) |mode| {
         const unit = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/coverage.zig"),
@@ -89,6 +134,10 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "coverage", .module = coverage }},
         }) });
         test_step.dependOn(&b.addRunArtifact(explore_unit).step);
+        if (mode == .debug) {
+            agree.addArtifactArg(unit);
+            agree.addArtifactArg(explore_unit);
+        }
     }
 }
 
