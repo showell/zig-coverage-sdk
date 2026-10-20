@@ -102,41 +102,128 @@ fn pokeByte(pid: linux.pid_t, addr: usize, byte: u8) !u8 {
 
 const Regs = [27]u64;
 
+/// What a traced task is to the breakpoints. `shared`: it runs in the
+/// leader's memory (the leader, a thread, a vfork child before its exec),
+/// so a breakpoint it hits is the leader's: recorded and put back, for all.
+/// A forked child is never one: it gets a copy of the patched text, which
+/// is put back as it was, and it is let go.
+const Kind = enum { shared, copy };
+
+/// `wait4`'s `__WALL`: threads (`CLONE_VM` children) too.
+const wall = 0x40000000;
+
+/// **A CHILD THAT FORKS MUST NOT DIE OF OUR BREAKPOINTS** (metal-vmm QUEUE
+/// 241 B; Shale's tests fork and exec the fixture and `shale --reap`): the
+/// tracer follows every fork, vfork and clone. A forked child, stopped
+/// before it runs, has the original bytes put back at every address ever
+/// patched (its copy may hold breakpoints the leader's threads have since
+/// put back in the leader) and is detached: its lines are not measured. A
+/// thread, or a vfork child until its exec, shares the leader's memory: it
+/// is traced as the leader is, a breakpoint any of them hits put back for
+/// all, and a task that hits one another already put back is stepped back
+/// to run the original. At its exec a vfork child is let go.
+///
 /// Runs `binary` to its end, the lines it hit added to `hit`; its exit
 /// status, or minus the signal that ended it.
 fn run(a: std.mem.Allocator, binary: [:0]const u8, envp: [*:null]const ?[*:0]const u8, table: Table, hit: *std.AutoArrayHashMapUnmanaged(u32, void)) !i32 {
     const fork_rc = linux.fork();
     try check(fork_rc, "fork");
-    const pid: linux.pid_t = @intCast(fork_rc);
-    if (pid == 0) {
+    const leader: linux.pid_t = @intCast(fork_rc);
+    if (leader == 0) {
         _ = linux.ptrace(PTRACE.TRACEME, 0, 0, 0, 0);
         const argv = [_:null]?[*:0]const u8{binary.ptr};
         _ = linux.execve(binary.ptr, &argv, envp);
         linux.exit(127);
     }
     var status: u32 = undefined;
-    try check(linux.waitpid(pid, @ptrCast(&status), 0), "wait"); // stopped at the exec
-    var saved: std.AutoArrayHashMapUnmanaged(usize, u8) = .empty;
-    for (table.keys()) |addr| try saved.put(a, addr, try pokeByte(pid, addr, 0xCC));
-    var sig: usize = 0;
+    try check(linux.waitpid(leader, @ptrCast(&status), 0), "wait"); // stopped at the exec
+    const O = PTRACE.O;
+    try check(linux.ptrace(PTRACE.SETOPTIONS, leader, 0, O.TRACEFORK | O.TRACEVFORK | O.TRACECLONE | O.TRACEEXEC | O.EXITKILL, 0), "setoptions");
+    // The original byte at every address patched, kept for a forked child.
+    var original: std.AutoArrayHashMapUnmanaged(usize, u8) = .empty;
+    // The addresses still patched in the leader's memory.
+    var saved: std.AutoArrayHashMapUnmanaged(usize, void) = .empty;
+    for (table.keys()) |addr| {
+        try original.put(a, addr, try pokeByte(leader, addr, 0xCC));
+        try saved.put(a, addr, {});
+    }
+    var tasks: std.AutoArrayHashMapUnmanaged(linux.pid_t, void) = .empty;
+    try tasks.put(a, leader, {});
+    // A new task announced by its parent's event, not yet seen stopped;
+    // and one seen stopped before its parent's event said what it is.
+    var announced: std.AutoArrayHashMapUnmanaged(linux.pid_t, Kind) = .empty;
+    var unannounced: std.AutoArrayHashMapUnmanaged(linux.pid_t, void) = .empty;
+    var leader_end: ?i32 = null;
+    try check(linux.ptrace(PTRACE.CONT, leader, 0, 0, 0), "cont");
     while (true) {
-        try check(linux.ptrace(PTRACE.CONT, pid, 0, sig, 0), "cont");
-        try check(linux.waitpid(pid, @ptrCast(&status), 0), "wait");
-        if (linux.W.IFEXITED(status)) return linux.W.EXITSTATUS(status);
-        if (linux.W.IFSIGNALED(status)) return -@as(i32, @intCast(@backingInt(linux.W.TERMSIG(status))));
-        const stop = linux.W.STOPSIG(status);
-        sig = @backingInt(stop);
-        if (stop != .TRAP) continue; // passed on to the program at the next continue
-        var regs: Regs = undefined;
-        try check(linux.ptrace(PTRACE.GETREGS, pid, 0, @intFromPtr(&regs), 0), "getregs");
-        const at = regs[rip] -% 1;
-        if (saved.fetchSwapRemove(at)) |kv| {
-            for (table.get(at).?) |l| try hit.put(a, l, {});
-            _ = try pokeByte(pid, at, kv.value);
-            regs[rip] = at;
-            try check(linux.ptrace(PTRACE.SETREGS, pid, 0, @intFromPtr(&regs), 0), "setregs");
-            sig = 0;
+        const rc = linux.wait4(-1, @ptrCast(&status), wall, null);
+        if (linux.errno(rc) == .CHILD) break;
+        if (linux.errno(rc) == .INTR) continue;
+        try check(rc, "wait");
+        const pid: linux.pid_t = @intCast(rc);
+        if (linux.W.IFEXITED(status) or linux.W.IFSIGNALED(status)) {
+            _ = tasks.swapRemove(pid);
+            if (pid == leader) leader_end = if (linux.W.IFEXITED(status)) linux.W.EXITSTATUS(status) else -@as(i32, @intCast(@backingInt(linux.W.TERMSIG(status))));
+            continue;
         }
+        if (!linux.W.IFSTOPPED(status)) continue;
+        const stop = linux.W.STOPSIG(status);
+        const event = status >> 16;
+        if (!tasks.contains(pid)) {
+            // A new task's first stop.
+            if (announced.fetchSwapRemove(pid)) |kv| try adopt(a, pid, kv.value, &tasks, original) else try unannounced.put(a, pid, {});
+            continue;
+        }
+        if (stop == .TRAP and event != 0) {
+            if (event == PTRACE.EVENT.FORK or event == PTRACE.EVENT.VFORK or event == PTRACE.EVENT.CLONE) {
+                var new: usize = undefined;
+                try check(linux.ptrace(PTRACE.GETEVENTMSG, pid, 0, @intFromPtr(&new), 0), "geteventmsg");
+                const child: linux.pid_t = @intCast(new);
+                const kind: Kind = if (event == PTRACE.EVENT.FORK) .copy else .shared;
+                if (unannounced.swapRemove(child)) try adopt(a, child, kind, &tasks, original) else try announced.put(a, child, kind);
+            } else if (event == PTRACE.EVENT.EXEC and pid != leader) {
+                // A vfork child at its exec: its new image was never patched.
+                _ = tasks.swapRemove(pid);
+                try check(linux.ptrace(PTRACE.DETACH, pid, 0, 0, 0), "detach");
+                continue;
+            }
+            try check(linux.ptrace(PTRACE.CONT, pid, 0, 0, 0), "cont");
+            continue;
+        }
+        var sig: usize = @backingInt(stop);
+        if (stop == .TRAP) {
+            var regs: Regs = undefined;
+            try check(linux.ptrace(PTRACE.GETREGS, pid, 0, @intFromPtr(&regs), 0), "getregs");
+            const at = regs[rip] -% 1;
+            if (original.get(at)) |byte| {
+                if (saved.swapRemove(at)) {
+                    for (table.get(at).?) |l| try hit.put(a, l, {});
+                    _ = try pokeByte(pid, at, byte);
+                }
+                // Hit here, or by another task that hit it before it was put back.
+                regs[rip] = at;
+                try check(linux.ptrace(PTRACE.SETREGS, pid, 0, @intFromPtr(&regs), 0), "setregs");
+                sig = 0;
+            }
+        }
+        // Any other signal is passed on to the program.
+        try check(linux.ptrace(PTRACE.CONT, pid, 0, sig, 0), "cont");
+    }
+    return leader_end orelse error.LeaderLost;
+}
+
+/// A new task, stopped before it ran: a thread or vfork child joins the
+/// traced; a forked child gets its text put back and is let go.
+fn adopt(a: std.mem.Allocator, pid: linux.pid_t, kind: Kind, tasks: *std.AutoArrayHashMapUnmanaged(linux.pid_t, void), original: std.AutoArrayHashMapUnmanaged(usize, u8)) !void {
+    switch (kind) {
+        .shared => {
+            try tasks.put(a, pid, {});
+            try check(linux.ptrace(PTRACE.CONT, pid, 0, 0, 0), "cont");
+        },
+        .copy => {
+            for (original.keys(), original.values()) |addr, byte| _ = try pokeByte(pid, addr, byte);
+            try check(linux.ptrace(PTRACE.DETACH, pid, 0, 0, 0), "detach");
+        },
     }
 }
 

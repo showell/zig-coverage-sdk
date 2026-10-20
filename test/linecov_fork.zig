@@ -45,7 +45,7 @@ test "a forked child, a vfork child and a thread each run a measured line" {
     try waitOk(forked);
 
     const top = @intFromPtr(&vfork_stack) + vfork_stack.len;
-    const vforked = linux.clone(vforkChild, top, linux.CLONE.VM | linux.CLONE.VFORK | @intFromEnum(linux.SIG.CHLD), 0, null, 0, null);
+    const vforked = linux.clone(vforkChild, top, linux.CLONE.VM | linux.CLONE.VFORK | @backingInt(linux.SIG.CHLD), 0, null, 0, null);
     try waitOk(vforked);
 
     var got: u32 = 0;
