@@ -80,7 +80,7 @@ fn parseTable(a: std.mem.Allocator, decoded: []const u8, sources: []const Source
         // `(\S+)\s+(\d+)\s+(0x[0-9a-f]+)` from the row's start.
         if (row.len == 0 or std.ascii.isWhitespace(row[0])) continue;
         var words = std.mem.tokenizeAny(u8, row, " \t\r\x0b\x0c");
-        _ = words.next() orelse continue;
+        const row_file = words.next() orelse continue;
         const line_word = words.next() orelse continue;
         const addr_word = words.next() orelse continue;
         for (line_word) |c| if (!std.ascii.isDigit(c)) continue :rows;
@@ -92,6 +92,11 @@ fn parseTable(a: std.mem.Allocator, decoded: []const u8, sources: []const Source
         const addr = std.fmt.parseInt(usize, addr_word[2..end], 16) catch continue;
         for (sources, 0..) |src, i| {
             if (!(std.mem.eql(u8, current, src.abs) or std.mem.eql(u8, current, src.base))) continue;
+            // readelf names a row's own file in its first column, and does not
+            // always print a new header when a line program moves to another
+            // file: a row of std's process.zig can follow a header naming the
+            // test's root. A row is the source's only when both say so.
+            if (!(std.mem.eql(u8, row_file, src.base) or endsWithPath(src.abs, row_file))) continue;
             const slot = try lists.getOrPut(a, addr);
             if (!slot.found_existing) slot.value_ptr.* = .empty;
             const k = key(i, line);
