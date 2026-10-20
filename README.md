@@ -79,7 +79,7 @@ lines into `COVERAGE_OUT`; zig-metal-unikernel's `long.sh` judges them with
 
 ## Using it
 
-It's a Zig package (Zig 0.16): the module `coverage`, plus the scanner
+It's a Zig package (Zig 0.17): the module `coverage`, plus the scanner
 described under "The catalog". Its first user,
 [zig-metal-unikernel](https://github.com/showell/zig-metal-unikernel), declares it as a
 path dependency on a sibling checkout:
