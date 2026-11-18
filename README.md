@@ -1,5 +1,28 @@
 # zig-coverage-sdk
 
+**Deprecated (2026-11-18): zig-coverage-sdk is no longer developed.**
+
+zig-coverage-sdk gives Zig coverage properties after Antithesis's SDK
+(`always`, `sometimes`, `reachable` and the rest), judged over a whole run,
+with a catalog so a property never reached is reported too. Its users were
+the metal stack: zig-metal-unikernel's simulators and `-Dcoverage` kernels
+emitted the properties, metal-vmm collected them, and `tools/report.py`
+judged them against a floor. The old Zig Shale used it for
+`zig build script-coverage`. It retires with them, with no successor.
+
+What we learned:
+- FAIL and MISS are different verdicts: a broken `always` says the code is
+  wrong, a `sometimes` never true says the run was short of the case, so a
+  quick gate fails on FAILs and only a long run on its floor's MISSes.
+- Nothing to judge is not a pass: a sweep of a kernel built without its
+  coverage once passed a whole night, 201 runs and 0 properties, so the
+  report now fails a run that reports none (SILENT).
+- The seed explorer's moments about doubled how often the lab reached its
+  deepest property, but on the kernel's own wide, shallow simulators they
+  reached no more than blind seeds, at 1.3 to 2 times the cost.
+
+---
+
 Assertions for Zig that are **properties of a whole run**, not checks that
 stop it. Includes a `sometimes` that fails when the case you meant to
 exercise never happened.
